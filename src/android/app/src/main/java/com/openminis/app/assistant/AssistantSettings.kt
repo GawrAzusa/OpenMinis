@@ -21,17 +21,26 @@ object AssistantSettings {
         )?.packageName == context.packageName
     }
 
-    fun open(context: Context) {
-        val candidates = buildList {
-            if (Build.VERSION.SDK_INT >= 29) {
-                val roles = context.getSystemService(RoleManager::class.java)
-                if (roles != null && roles.isRoleAvailable(RoleManager.ROLE_ASSISTANT) &&
-                    !roles.isRoleHeld(RoleManager.ROLE_ASSISTANT)
-                ) add(roles.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT))
+    fun open(context: Context, launchRoleRequest: (Intent) -> Unit) {
+        if (Build.VERSION.SDK_INT >= 29) {
+            val roles = context.getSystemService(RoleManager::class.java)
+            if (roles != null && roles.isRoleAvailable(RoleManager.ROLE_ASSISTANT) &&
+                !roles.isRoleHeld(RoleManager.ROLE_ASSISTANT)
+            ) {
+                try {
+                    // The role controller identifies the requesting package via
+                    // startActivityForResult. A NEW_TASK context launch loses it.
+                    launchRoleRequest(roles.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT))
+                    return
+                } catch (_: ActivityNotFoundException) {
+                    // Fall back to the ordinary system settings UI.
+                } catch (_: SecurityException) {
+                    // Some managed/OEM profiles restrict role requests.
+                }
             }
-            add(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS))
-            add(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
         }
+        val candidates = listOf(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS),
+            Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
         for (intent in candidates) {
             try {
                 context.startActivity(intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))

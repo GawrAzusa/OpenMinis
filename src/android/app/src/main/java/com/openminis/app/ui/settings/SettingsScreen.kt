@@ -113,6 +113,11 @@ fun SettingsScreen(
     var assistantSelected by remember {
         mutableStateOf(com.openminis.app.assistant.AssistantSettings.isSelected(context))
     }
+    val assistantRoleLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.StartActivityForResult(),
+    ) {
+        assistantSelected = com.openminis.app.assistant.AssistantSettings.isSelected(context)
+    }
     val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
     androidx.compose.runtime.DisposableEffect(lifecycle, context) {
         val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
@@ -184,7 +189,11 @@ fun SettingsScreen(
                     title = stringResource(R.string.assistant_settings_title),
                     subtitle = stringResource(if (assistantSelected)
                         R.string.assistant_settings_selected else R.string.assistant_settings_choose),
-                    onClick = { com.openminis.app.assistant.AssistantSettings.open(context) },
+                    onClick = {
+                        com.openminis.app.assistant.AssistantSettings.open(context) {
+                            assistantRoleLauncher.launch(it)
+                        }
+                    },
                     showDivider = false,
                 )
             }

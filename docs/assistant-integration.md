@@ -38,12 +38,15 @@ git submodule update --init deps/proot
 install -D deps/build/rclone/rclone.aar src/android/app/libs/rclone.aar
 cd src/android
 ./gradlew :app:testDebugUnitTest --tests 'com.openminis.app.assistant.*'
-./gradlew :app:assembleDebug :app:assembleDebugAndroidTest
-./gradlew :app:connectedDebugAndroidTest \
+./gradlew :app:assembleDebug
+./gradlew -PassistantOnlyInstrumentation=true :app:assembleDebugAndroidTest
+./gradlew -PassistantOnlyInstrumentation=true :app:connectedDebugAndroidTest \
   -Pandroid.testInstrumentationRunnerArguments.package=com.openminis.app.assistant
 ```
 
 The original project builds ARM64 only. Do not count successful APK packaging as proof of ARM64 sandbox execution on an x86 emulator. Missing native assets must be built, not stubbed or replaced with unrelated binaries. Self-built packages use the upstream debug signing configuration; they cannot update an official package signed with a different key. Never uninstall a user's existing installation or discard its data to work around a signature mismatch.
+
+The explicit `assistantOnlyInstrumentation` property compiles only this feature's device tests. Without it, the upstream `ExecutionCoordinatorInstrumentedTest` currently fails to compile because it still references the removed global `mountedSessionId` API. The normal full test source set is unchanged; a scoped pass must not be reported as full-suite success. The feature harness also exercises real local VAD/AudioRecord cancellation without configuring a cloud provider or uploading audio.
 
 ## Acceptance matrix
 

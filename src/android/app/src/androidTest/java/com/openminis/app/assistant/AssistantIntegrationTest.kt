@@ -29,7 +29,7 @@ class AssistantIntegrationTest {
 
     @Test fun voiceAssistResolvesWithoutUri() {
         assertNotNull(context.packageManager.resolveActivity(
-            Intent(Intent.ACTION_VOICE_ASSIST).setPackage(context.packageName),
+            Intent("android.intent.action.VOICE_ASSIST").setPackage(context.packageName),
             PackageManager.MATCH_DEFAULT_ONLY,
         ))
     }
@@ -37,7 +37,7 @@ class AssistantIntegrationTest {
     @Test fun assistantActionDoesNotNeedOrExecuteCallerData() {
         assertEquals(DeepLinkAction.NewAssistantChat, DeepLinkHandler.parseLaunch(Intent.ACTION_ASSIST, null))
         assertEquals(DeepLinkAction.NewAssistantChat, DeepLinkHandler.parseLaunch(
-            Intent.ACTION_VOICE_ASSIST, Uri.parse("minis://open_terminal?init_command=untrusted"),
+            "android.intent.action.VOICE_ASSIST", Uri.parse("minis://open_terminal?init_command=untrusted"),
         ))
     }
 

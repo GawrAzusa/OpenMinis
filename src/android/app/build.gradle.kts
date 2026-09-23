@@ -108,6 +108,13 @@ android {
     sourceSets {
         getByName("androidTest") {
             assets.srcDirs("$projectDir/schemas")
+            // Opt-in feature-only harness. The public baseline's unrelated
+            // ExecutionCoordinator tests reference a removed mountedSessionId
+            // API and do not compile. Keep the default full suite unchanged;
+            // never report this scoped run as a full-suite pass.
+            if (providers.gradleProperty("assistantOnlyInstrumentation").orNull == "true") {
+                java.setSrcDirs(listOf("src/androidTest/java/com/openminis/app/assistant"))
+            }
         }
     }
 
