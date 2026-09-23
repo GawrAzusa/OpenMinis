@@ -11,7 +11,11 @@ import com.openminis.app.R
 
 /** Ask Android to select the assistant. Never write secure settings or grant permissions. */
 object AssistantSettings {
-    fun isSelected(context: Context): Boolean = if (Build.VERSION.SDK_INT >= 29) {
+    fun isSelected(context: Context): Boolean = android.service.voice.VoiceInteractionService.isActiveService(
+        context, android.content.ComponentName(context, MinisVoiceInteractionService::class.java),
+    )
+
+    private fun isPackageSelected(context: Context): Boolean = if (Build.VERSION.SDK_INT >= 29) {
         context.getSystemService(RoleManager::class.java)?.let {
             it.isRoleAvailable(RoleManager.ROLE_ASSISTANT) && it.isRoleHeld(RoleManager.ROLE_ASSISTANT)
         } ?: false

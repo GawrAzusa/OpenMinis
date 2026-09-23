@@ -107,6 +107,11 @@ class ReadAloudPlayer(context: Context) {
     private val _isSpeaking = MutableStateFlow(false)
     val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
 
+    data class OutputRoute(val kind: String, val modelLabel: String? = null, val fallback: Boolean = false)
+    private val _outputRoute = MutableStateFlow(OutputRoute("idle"))
+    /** Last attempted output route; system fallback is explicit, not a fabricated voice identity. */
+    val outputRoute: StateFlow<OutputRoute> = _outputRoute.asStateFlow()
+
     /**
      * Rolling buffer for streaming input. Mirrors [TextToSpeechManager]'s own
      * buffer, but lives here so the sentence split happens BEFORE the routing
@@ -337,8 +342,10 @@ class ReadAloudPlayer(context: Context) {
                 VoiceOutputState.activeModelLabel.value =
                     modelEntry.model.displayName.ifBlank { modelEntry.model.id }
             }
+            _outputRoute.value = OutputRoute("provider", modelEntry.model.displayName.ifBlank { modelEntry.model.id })
             val ok = runCatching { speakViaProvider(instance, modelEntry, text) }
                 .getOrElse {
+                    if (it is kotlinx.coroutines.CancellationException) throw it
                     AppLogger.error(
                         TAG,
                         "provider TTS failed (model=${modelEntry.model.id} " +
@@ -349,7 +356,9 @@ class ReadAloudPlayer(context: Context) {
             if (ok) return
         }
         if (ownsCapsule()) VoiceOutputState.activeModelLabel.value = null // system engine
+        _outputRoute.value = OutputRoute("system", fallback = entry != null)
         if (!speakViaSystem(text)) {
+            _outputRoute.value = OutputRoute("unavailable", fallback = entry != null)
             // [T-android-tts-silent-blackhole] Terminal state: the provider path
             // did not produce audio AND the device speech engine is unusable.
             // iOS can't reach this (AVSpeechSynthesizer always exists), which is

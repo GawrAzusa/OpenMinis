@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<voice-interaction-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:sessionService="com.openminis.app.assistant.MinisVoiceSessionService"
+    android:recognitionService="com.openminis.app.assistant.AssistantRecognitionService"
+    android:settingsActivity="com.openminis.app.MainActivity"
+    android:supportsAssist="true"
+    android:supportsLaunchVoiceAssistFromKeyguard="false"
+    android:supportsLocalInteraction="false" />

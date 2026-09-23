@@ -159,6 +159,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (com.openminis.app.assistant.AssistantLaunch.isAssistAction(intent?.action)) {
+            startActivity(Intent(this, com.openminis.app.assistant.AssistantEntryActivity::class.java))
+            finish()
+            return
+        }
 
         // Register the crash-share "Save to..." launcher BEFORE the
         // safe-mode early-return below — ActivityResultLauncher must be
@@ -705,6 +710,11 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        if (com.openminis.app.assistant.AssistantLaunch.isAssistAction(intent.action)) {
+            moveTaskToBack(true)
+            startActivity(Intent(this, com.openminis.app.assistant.AssistantEntryActivity::class.java))
+            return
+        }
         pendingAssistantLaunch?.cancel()
         com.openminis.app.assistant.AssistantLaunch.cancelPending()
         setIntent(intent)

@@ -17,13 +17,13 @@ import org.junit.runner.RunWith
 class AssistantIntegrationTest {
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
 
-    @Test fun assistResolvesToMainActivityWithoutUri() {
+    @Test fun assistResolvesToCompactEntryWithoutUri() {
         val resolved = context.packageManager.resolveActivity(
             Intent(Intent.ACTION_ASSIST).setPackage(context.packageName),
             PackageManager.MATCH_DEFAULT_ONLY,
         )
         assertNotNull(resolved)
-        assertEquals(MainActivity::class.java.name, resolved!!.activityInfo.name)
+        assertEquals(AssistantEntryActivity::class.java.name, resolved!!.activityInfo.name)
         assertTrue(resolved.activityInfo.exported)
     }
 

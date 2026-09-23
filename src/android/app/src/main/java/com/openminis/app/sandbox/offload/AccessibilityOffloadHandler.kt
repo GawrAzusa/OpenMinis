@@ -12,6 +12,7 @@ import com.openminis.app.accessibility.AccessibilityRecoveryManager
 import com.openminis.app.accessibility.MinisAccessibilityService
 import com.openminis.app.accessibility.NodeRegistry
 import com.openminis.app.accessibility.RestrictedSettingsManager
+import com.openminis.app.assistant.AssistantToolSurface
 import com.openminis.app.logging.AppLogger
 import com.openminis.app.sandbox.NativeOffloadHandler
 import com.openminis.app.sandbox.NativeOffloadRequest
@@ -95,6 +96,13 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             return NativeOffloadResult(if (args.positional.isEmpty()) 2 else 0, TOP_HELP)
         }
         val sub = args.positional[0]
+        // Capture ownership before either asynchronous gate, without hiding the UI.
+        val admission = try {
+            if (AssistantToolSurface.isVisual(sub, args.positional.getOrNull(1)))
+                AssistantToolSurface.admit(request.sessionId) else null
+        } catch (e: AssistantToolSurface.Unavailable) {
+            return err(args, "ASSISTANT_PAUSED", e.message ?: "Assistant phone controls are paused.")
+        }
         // T330: tri-state agent gate via OffloadPermissionManager. `service`
         // and `--version` are diagnostic and pass through so the agent (or
         // a curious developer) can still verify the service runs even when
@@ -129,7 +137,9 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         // block the worker indefinitely.
         if (sub != "service" && sub != "--version") {
             val usable = kotlinx.coroutines.runBlocking {
-                AccessibilityRecoveryManager.ensureGrantOrPrompt(context)
+                AssistantToolSurface.withRepairGuidance(request.sessionId) {
+                    AccessibilityRecoveryManager.ensureGrantOrPrompt(context)
+                }
             }
             if (!usable) {
                 // [T-android-restricted-settings] Distinguish the two reasons
@@ -171,7 +181,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             statusForSubAction(sub, args.positional.getOrNull(1), args),
         )
         return try {
-            when (sub) {
+            val dispatch = { when (sub) {
                 "ui"        -> uiSub(args)
                 "tap"       -> tapSub(args)
                 "input"     -> inputSub(args)
@@ -185,7 +195,12 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
                 "service"   -> serviceSub(args)
                 "--version" -> NativeOffloadResult(0, "android-a11y-cli 0.1\n")
                 else        -> NativeOffloadResult(2, "$TOOL: unknown subcommand '$sub'\n$TOP_HELP")
-            }
+            } }
+            if (admission != null) {
+                AssistantToolSurface.withUnderlyingApp(admission, dispatch)
+            } else dispatch()
+        } catch (e: AssistantToolSurface.Unavailable) {
+            err(args, "ASSISTANT_PAUSED", e.message ?: "Assistant phone controls are paused.")
         } catch (e: NotRunning) {
             err(args, "SERVICE_NOT_RUNNING",
                 e.message ?: "Accessibility service is not running. Enable Minis under Settings → Accessibility.",
@@ -405,7 +420,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         val displayId = args.getInt("display") ?: Display.DEFAULT_DISPLAY
         val inline = args.hasFlag("inline", "b")
 
-        val shot = svc.captureScreenshot(displayId)
+        val shot = visualAction { svc.captureScreenshot(displayId) }
         val raw = shot.bitmap
             ?: return err(args, shot.errorCode ?: "TAKE_SCREENSHOT_FAILED",
                 shot.errorMessage ?: "takeScreenshot failed")
@@ -480,7 +495,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             val r = Rect(); n.getBoundsInScreen(r)
             return tapXYRaw(svc, r.centerX(), r.centerY(), args)
         }
-        return if (n.performAction(action))
+        return if (visualAction { n.performAction(action) })
             ok(args, JSONObject().put("nodeId", nodeId).put("action", "click"))
         else err(args, "ACTION_FAILED", "performAction($action) returned false")
     }
@@ -500,10 +515,10 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             moveTo(x.toFloat(), y.toFloat())
             lineTo(x.toFloat() + 0.1f, y.toFloat() + 0.1f)
         }
-        val gestureOk = svc.dispatchSimpleGesture(path, 0L, duration)
+        val gestureOk = visualAction { svc.dispatchSimpleGesture(path, 0L, duration) }
         if (args.hasFlag("double")) {
-            Thread.sleep(80)
-            svc.dispatchSimpleGesture(path, 0L, duration)
+            toolSleep(80)
+            visualAction { svc.dispatchSimpleGesture(path, 0L, duration) }
         }
         return if (gestureOk) ok(args, JSONObject().put("x", x).put("y", y).put("action", "tap"))
         else err(args, "GESTURE_FAILED", "dispatchGesture returned cancelled / timed out")
@@ -520,7 +535,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         val n = matches.getOrNull(index)
             ?: return err(args, "NODE_NOT_FOUND",
                 "no node with text${if (contains) " containing " else "="}\"$text\" (matches: ${matches.size})")
-        if (n.isClickable) n.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        if (n.isClickable) visualAction { n.performAction(AccessibilityNodeInfo.ACTION_CLICK) }
         else {
             val r = Rect(); n.getBoundsInScreen(r)
             tapXYRaw(svc, r.centerX(), r.centerY(), args)
@@ -551,7 +566,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         for (root in svc.rootNodes()) findByResourceId(root, rid, 30, 0, matches)
         val n = matches.firstOrNull()
             ?: return err(args, "NODE_NOT_FOUND", "no node with resource-id=$rid")
-        return if (n.performAction(AccessibilityNodeInfo.ACTION_CLICK))
+        return if (visualAction { n.performAction(AccessibilityNodeInfo.ACTION_CLICK) })
             ok(args, JSONObject().put("resourceId", rid).put("action", "click"))
         else err(args, "ACTION_FAILED", "performAction(CLICK) returned false")
     }
@@ -588,7 +603,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             args.hasFlag("append") -> (node.text?.toString() ?: "") + text
             else                   -> text
         }
-        return if (svc.setNodeText(node, finalText))
+        return if (visualAction { svc.setNodeText(node, finalText) })
             ok(args, JSONObject().put("text", finalText).put("action", "setText"))
         else err(args, "ACTION_FAILED", "ACTION_SET_TEXT failed (node may not be editable)")
     }
@@ -597,7 +612,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         val svc = svcOrThrow()
         val node = resolveTargetEditable(svc, args)
             ?: return err(args, "NODE_NOT_FOUND", "no editable focus and no --node specified")
-        return if (svc.setNodeText(node, ""))
+        return if (visualAction { svc.setNodeText(node, "") })
             ok(args, JSONObject().put("action", "clear"))
         else err(args, "ACTION_FAILED", "ACTION_SET_TEXT('') failed")
     }
@@ -607,10 +622,10 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         val keyName = args.positional.getOrNull(2)
             ?: return NativeOffloadResult(2, "$TOOL input key: missing <keycode>\n")
         return when (keyName.uppercase()) {
-            "BACK" -> { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK); ok(args, JSONObject().put("key", "BACK")) }
-            "HOME" -> { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME); ok(args, JSONObject().put("key", "HOME")) }
-            "RECENTS" -> { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS); ok(args, JSONObject().put("key", "RECENTS")) }
-            "NOTIFICATIONS" -> { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS); ok(args, JSONObject().put("key", "NOTIFICATIONS")) }
+            "BACK" -> { visualAction { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK) }; ok(args, JSONObject().put("key", "BACK")) }
+            "HOME" -> { visualAction { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME) }; ok(args, JSONObject().put("key", "HOME")) }
+            "RECENTS" -> { visualAction { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS) }; ok(args, JSONObject().put("key", "RECENTS")) }
+            "NOTIFICATIONS" -> { visualAction { svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS) }; ok(args, JSONObject().put("key", "NOTIFICATIONS")) }
             else -> err(args, "INVALID_ARGS",
                 "key '$keyName' not supported via accessibility (try BACK/HOME/RECENTS/NOTIFICATIONS; for ENTER/DPAD use shizuku-cli `input keyevent`)")
         }
@@ -651,7 +666,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             else -> return err(args, "INVALID_ARGS", "--direction must be up|down|left|right")
         }
         var done = 0
-        repeat(times) { if (n.performAction(action)) done++ }
+        repeat(times) { if (visualAction { n.performAction(action) }) done++ }
         return ok(args, JSONObject().put("scrolled", done).put("direction", direction))
     }
 
@@ -672,7 +687,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             else -> return err(args, "INVALID_ARGS", "--direction must be up|down|left|right")
         }
         val path = Path().apply { moveTo(x.toFloat(), y.toFloat()); lineTo((x + dx).toFloat(), (y + dy).toFloat()) }
-        return if (svc.dispatchSimpleGesture(path, 0L, duration))
+        return if (visualAction { svc.dispatchSimpleGesture(path, 0L, duration) })
             ok(args, JSONObject().put("direction", direction).put("distance", distance))
         else err(args, "GESTURE_FAILED", "scroll gesture cancelled")
     }
@@ -697,16 +712,16 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             if (hit != null) return ok(args, JSONObject()
                 .put("found", true)
                 .put("node", nodeToJson(svc.nodeRegistry, hit, 0, compact = true)))
-            val scrolled = container?.performAction(action) ?: run {
+            val scrolled = container?.let { visualAction { it.performAction(action) } } ?: run {
                 var any = false
                 for (root in svc.rootNodes()) {
                     val s = firstScrollable(root, 30, 0)
-                    if (s != null) { any = s.performAction(action); break }
+                    if (s != null) { any = visualAction { s.performAction(action) }; break }
                 }
                 any
             }
             if (!scrolled) return ok(args, JSONObject().put("found", false).put("reason", "scroll_action_rejected"))
-            Thread.sleep(400)
+            toolSleep(400)
         }
         return ok(args, JSONObject().put("found", false))
     }
@@ -738,7 +753,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         val y2 = args.positional.getOrNull(5)?.toIntOrNull() ?: return NativeOffloadResult(2, "$TOOL gesture swipe: missing <y2>\n")
         val duration = args.getLong("duration") ?: 300L
         val path = Path().apply { moveTo(x1.toFloat(), y1.toFloat()); lineTo(x2.toFloat(), y2.toFloat()) }
-        return if (svc.dispatchSimpleGesture(path, 0L, duration))
+        return if (visualAction { svc.dispatchSimpleGesture(path, 0L, duration) })
             ok(args, JSONObject().put("from", JSONArray().put(x1).put(y1)).put("to", JSONArray().put(x2).put(y2)))
         else err(args, "GESTURE_FAILED", "swipe cancelled")
     }
@@ -749,7 +764,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         val cy = args.positional.getOrNull(3)?.toFloatOrNull() ?: return NativeOffloadResult(2, "$TOOL gesture pinch: missing <cy>\n")
         val scale = args.getDouble("scale")?.toFloat() ?: 0.5f
         val duration = args.getLong("duration") ?: 300L
-        return if (svc.dispatchPinch(cx, cy, scale, duration))
+        return if (visualAction { svc.dispatchPinch(cx, cy, scale, duration) })
             ok(args, JSONObject().put("center", JSONArray().put(cx).put(cy)).put("scale", scale))
         else err(args, "GESTURE_FAILED", "pinch cancelled")
     }
@@ -768,7 +783,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             for (i in 1 until pts.size) lineTo(pts[i].first, pts[i].second)
         }
         val duration = args.getLong("duration") ?: (pts.size * 100L)
-        return if (svc.dispatchSimpleGesture(path, 0L, duration))
+        return if (visualAction { svc.dispatchSimpleGesture(path, 0L, duration) })
             ok(args, JSONObject().put("points", pts.size))
         else err(args, "GESTURE_FAILED", "path cancelled")
     }
@@ -807,7 +822,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
                     else ok(args, JSONObject().put("disappeared", true))
                 }
             }
-            Thread.sleep(200)
+            toolSleep(200)
         }
         return ok(args, JSONObject().put("found", false).put("timedOut", true))
     }
@@ -828,7 +843,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
         var lastSig = treeSignature(svc)
         var stableSince = System.currentTimeMillis()
         while (System.currentTimeMillis() < deadline) {
-            Thread.sleep(interval)
+            toolSleep(interval)
             val sig = treeSignature(svc)
             if (sig != lastSig) { lastSig = sig; stableSince = System.currentTimeMillis() }
             else if (System.currentTimeMillis() - stableSince >= stableDuration) {
@@ -862,7 +877,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             val pkgOk = pkg == null || p == pkg
             val actOk = act == null || c == act || (act.startsWith(".") && (c?.endsWith(act) == true))
             if (pkgOk && actOk) return ok(args, JSONObject().put("packageName", p ?: "").put("activityName", c ?: ""))
-            Thread.sleep(200)
+            toolSleep(200)
         }
         return ok(args, JSONObject().put("timedOut", true))
     }
@@ -907,7 +922,7 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
                     sb.append(obj.toString()).append('\n')
                     if (once) return NativeOffloadResult(0, sb.toString())
                 }
-                Thread.sleep(50)
+                toolSleep(50)
             }
         } finally {
             svc.removeEventListener(listener)
@@ -999,12 +1014,12 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
             for (root in svc.rootNodes()) findByTextOrDesc(root, label, contains = false, 30, 0, matches)
             val btn = matches.firstOrNull { it.isClickable } ?: matches.firstOrNull()
             if (btn != null) {
-                val clicked = if (btn.isClickable) btn.performAction(AccessibilityNodeInfo.ACTION_CLICK) else {
+                val clicked = if (btn.isClickable) visualAction { btn.performAction(AccessibilityNodeInfo.ACTION_CLICK) } else {
                     val r = Rect(); btn.getBoundsInScreen(r)
-                    svc.dispatchSimpleGesture(
+                    visualAction { svc.dispatchSimpleGesture(
                         Path().apply { moveTo(r.exactCenterX(), r.exactCenterY()); lineTo(r.exactCenterX() + 0.1f, r.exactCenterY() + 0.1f) },
                         0L, 50L
-                    )
+                    ) }
                 }
                 if (clicked) return ok(args, JSONObject().put("dismissed", true).put("button", label))
             }
@@ -1077,9 +1092,9 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
                 if (items.size >= maxItems) break
             }
             if (!autoScroll || items.size >= maxItems) break
-            val scrolled = container.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD)
+            val scrolled = visualAction { container.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) }
             if (!scrolled) break
-            Thread.sleep(400)
+            toolSleep(400)
             iter++
         } while (iter < 30)
         val arr = JSONArray()
@@ -1113,9 +1128,22 @@ First-run: enable "Minis" under Settings → Accessibility, then `service ping`.
 
     private class NotRunning(msg: String) : RuntimeException(msg)
 
-    private fun svcOrThrow(): MinisAccessibilityService =
-        MinisAccessibilityService.getInstance()
+    private fun svcOrThrow(): MinisAccessibilityService {
+        AssistantToolSurface.checkDispatch()
+        return MinisAccessibilityService.getInstance()
             ?: throw NotRunning("Accessibility service is not running. Enable Minis under Settings → Accessibility.")
+    }
+
+    private fun toolSleep(milliseconds: Long) {
+        AssistantToolSurface.checkDispatch()
+        Thread.sleep(milliseconds)
+        AssistantToolSurface.checkDispatch()
+    }
+
+    private inline fun <T> visualAction(action: () -> T): T {
+        AssistantToolSurface.checkDispatch()
+        return action()
+    }
 
     private fun ok(args: OffloadArgs, data: Any): NativeOffloadResult {
         val body = JSONObject().put("ok", true).put("data", data).toString()

@@ -310,8 +310,22 @@ class GeminiProvider(
                         parts.put(JSONObject().put("inlineData", inlineData))
                     }
                 }
-                val legacyText = msg.content.ifEmpty { " " }
-                parts.put(JSONObject().put("text", legacyText))
+                if (msg.content.isNotEmpty() || msg.audioParts.isEmpty()) {
+                    val legacyText = msg.content.ifEmpty { " " }
+                    parts.put(JSONObject().put("text", legacyText))
+                }
+            }
+            // generateContent (including SSE), not Live: audio is an inline binary
+            // part alongside text/images. Replay each turn, not just the last user
+            // turn, so tool followups and restored history retain the original WAV.
+            // https://ai.google.dev/gemini-api/docs/audio
+            for (audio in msg.audioParts) {
+                require(msg.role == LLMMessage.Role.USER) { "Gemini audio input requires a user turn." }
+                require(audio.format == "wav") { "Gemini assistant audio input requires WAV." }
+                parts.put(JSONObject().put("inlineData", JSONObject().apply {
+                    put("mimeType", "audio/wav")
+                    put("data", audio.base64Data)
+                }))
             }
             // [T-gemini-empty-part-oneof-400] Parity with iOS convertMessages: a
             // turn whose only content was an empty .Text (skipped above) would

@@ -380,6 +380,9 @@ class OpenAIProvider private constructor(
      */
     private val usesChatCompletionsAPI: Boolean get() = forceChatCompletions || (!isOAuth && !useResponsesAPI)
 
+    /** Responses/Codex audio acceptance is not assumed from an OpenAI-compatible label. */
+    val supportsAssistantAudioTransport: Boolean get() = usesChatCompletionsAPI
+
     /**
      * [T-android-tool-splits-reply-fix] Chat Completions streams ONE
      * monolithic `content` string per assistant response — qwen endpoints
@@ -2148,8 +2151,8 @@ class OpenAIProvider private constructor(
                         // populated (which is always now). Mirrors iOS
                         // OpenAIAgentProvider.swift L732-738.
                         val hasImages = imageParts.isNotEmpty()
-                        if (hasImages || textParts.isNotEmpty()) {
-                            if (hasImages) {
+                        if (hasImages || textParts.isNotEmpty() || msg.audioParts.isNotEmpty()) {
+                            if (hasImages || msg.audioParts.isNotEmpty()) {
                                 val contentArray = JSONArray()
                                 // Walk contentParts in original order so the
                                 // [attached image: …] text caption that
@@ -2193,6 +2196,11 @@ class OpenAIProvider private constructor(
                                         }
                                         else -> Unit  // ToolUse/ToolResult never appear on user role here
                                     }
+                                }
+                                for (audio in msg.audioParts) {
+                                    contentArray.put(JSONObject().put("type", "input_audio")
+                                        .put("input_audio", JSONObject().put("data", audio.base64Data)
+                                            .put("format", audio.format)))
                                 }
                                 messagesArray.put(JSONObject().apply {
                                     put("role", "user")

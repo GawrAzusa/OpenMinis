@@ -6482,32 +6482,9 @@ fun ChatScreen(
                                 }.collect { (live, streamingNow, toolBlocks) ->
                                     val toolCount = toolBlocks.size
                                     if (toolCount > lastToolCount) {
-                                        // Flush first so the half-sentence that
-                                        // preceded the tool call is spoken
-                                        // BEFORE the announcement, not after it.
+                                        // Speak only assistant prose. Tool names, arguments and results
+                                        // are never added to the speech queue.
                                         replyTts.flush()
-                                        // [T-android-tts-tool-announce] Announce
-                                        // each newly-started tool, mirroring iOS
-                                        // (makeToolSpeech + speakQueued). Without
-                                        // this a listener hears the narration stop
-                                        // dead for however long the tool runs,
-                                        // with no cue as to why — the screen shows
-                                        // a pill, but the whole point of read-aloud
-                                        // is not having to look.
-                                        //
-                                        // Queued, never speak(): that would stop
-                                        // playback and cut off the sentence just
-                                        // flushed above.
-                                        for (i in lastToolCount until toolCount) {
-                                            val b = toolBlocks.getOrNull(i) ?: continue
-                                            replyTts.speakQueued(
-                                                com.openminis.app.speech.ToolSpeech.announcement(
-                                                    name = b.toolName,
-                                                    argsJson = b.toolArgs,
-                                                    title = b.toolTitle.takeIf { it.isNotBlank() },
-                                                )
-                                            )
-                                        }
                                         lastToolCount = toolCount
                                     }
                                     // Turn end drains the side-channel AFTER
