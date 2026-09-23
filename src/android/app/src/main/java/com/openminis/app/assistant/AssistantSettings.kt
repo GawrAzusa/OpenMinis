@@ -21,24 +21,10 @@ object AssistantSettings {
         )?.packageName == context.packageName
     }
 
-    fun open(context: Context, launchRoleRequest: (Intent) -> Unit) {
-        if (Build.VERSION.SDK_INT >= 29) {
-            val roles = context.getSystemService(RoleManager::class.java)
-            if (roles != null && roles.isRoleAvailable(RoleManager.ROLE_ASSISTANT) &&
-                !roles.isRoleHeld(RoleManager.ROLE_ASSISTANT)
-            ) {
-                try {
-                    // The role controller identifies the requesting package via
-                    // startActivityForResult. A NEW_TASK context launch loses it.
-                    launchRoleRequest(roles.createRequestRoleIntent(RoleManager.ROLE_ASSISTANT))
-                    return
-                } catch (_: ActivityNotFoundException) {
-                    // Fall back to the ordinary system settings UI.
-                } catch (_: SecurityException) {
-                    // Some managed/OEM profiles restrict role requests.
-                }
-            }
-        }
+    fun open(context: Context) {
+        // ASSISTANT can be available but explicitly non-requestable (including
+        // Android 15). createRequestRoleIntent then silently returns canceled.
+        // The user-controlled system settings picker works for activity assistants.
         val candidates = listOf(Intent(Settings.ACTION_VOICE_INPUT_SETTINGS),
             Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS))
         for (intent in candidates) {
