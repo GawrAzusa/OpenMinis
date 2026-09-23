@@ -1,5 +1,7 @@
 package com.openminis.app.ui.chat.voice
 
+import kotlinx.coroutines.flow.first
+
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
@@ -176,6 +178,9 @@ fun InlineVoiceInputPanel(
     onInputTextChange: (String) -> Unit,
     ensureMicPermission: suspend () -> Boolean,
     modifier: Modifier = Modifier,
+    autoStartRequested: Boolean = false,
+    onAutoStartConsumed: () -> Unit = {},
+    onAssistantRequest: (String) -> Unit = {},
     // [T-android-correction-context-wiring] Supplies the conversation context
     // for AI correction, built from the chat's current messages. Mirrors iOS
     // InlineVoiceInputView's `conversationContext` closure. Defaults to EMPTY so
@@ -186,6 +191,9 @@ fun InlineVoiceInputPanel(
 ) {
     val scope = androidx.compose.runtime.rememberCoroutineScope()
     val sttState by SpeechRecognitionManager.state.collectAsState()
+    val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
+    val assistantTurn = remember { com.openminis.app.assistant.AssistantVoiceTurn() }
+    val currentAssistantRequest by androidx.compose.runtime.rememberUpdatedState(onAssistantRequest)
     val locale by SpeechRecognitionManager.locale.collectAsState()
     val supportedLocales by SpeechRecognitionManager.supportedLocales.collectAsState()
     val levels by SpeechRecognitionManager.audioLevels.collectAsState()
@@ -194,6 +202,11 @@ fun InlineVoiceInputPanel(
     // Idempotent, so running on every composition is harmless.
     val panelContext = androidx.compose.ui.platform.LocalContext.current
     VoiceModePrefs.init(panelContext)
+
+    fun foregroundAndUnlocked(): Boolean =
+        lifecycle.currentState == androidx.lifecycle.Lifecycle.State.RESUMED &&
+            panelContext.getSystemService(android.app.KeyguardManager::class.java)
+                ?.isKeyguardLocked != true
 
     var expanded by remember { mutableStateOf(VoiceModePrefs.expanded) }
     var transcript by remember { mutableStateOf(inputText) }
@@ -354,8 +367,17 @@ fun InlineVoiceInputPanel(
                 val joined = captureBase + sep + text
                 captureBase = joined
                 setTranscript(joined)
+                assistantTurn.takeFinal(joined, isFinal, foregroundAndUnlocked())?.let { request ->
+                    // Disarm before stopping: late/duplicate engine results must
+                    // not submit a second task. Reuse the ordinary agent path.
+                    scope.launch {
+                        SpeechRecognitionManager.cancelRecording()
+                        if (foregroundAndUnlocked()) currentAssistantRequest(request)
+                    }
+                }
             },
             onError = { error, message ->
+                assistantTurn.cancel()
                 when (error) {
                     com.openminis.app.speech.RecognitionError.NO_MATCH -> {}
                     com.openminis.app.speech.RecognitionError.PERMISSION_DENIED ->
@@ -367,6 +389,8 @@ fun InlineVoiceInputPanel(
     }
 
     fun handleMicTap() {
+        // A manual tap returns control to the normal review/send flow.
+        assistantTurn.cancel()
         when {
             isTranscribing -> {
                 // Spinner while idle → X cancels the in-flight transcription.
@@ -388,6 +412,50 @@ fun InlineVoiceInputPanel(
     }
 
     // ── Lifecycle: prepare on mount (default groups + engine warm), stop on exit.
+    LaunchedEffect(autoStartRequested) {
+        if (!autoStartRequested) return@LaunchedEffect
+        assistantTurn.request()
+        lifecycle.currentStateFlow.first { it == androidx.lifecycle.Lifecycle.State.RESUMED }
+        if (!assistantTurn.pending) {
+            // The user left or took manual control while this request waited.
+        } else if (!foregroundAndUnlocked()) {
+            android.widget.Toast.makeText(panelContext, R.string.assistant_unlock_first,
+                android.widget.Toast.LENGTH_LONG).show()
+        } else if (!ensureMicPermission()) {
+            permissionDenied = true
+        } else {
+            // Permission UI can pause the Activity; wait for its return before
+            // recording. Never capture behind the lock screen.
+            lifecycle.currentStateFlow.first { it == androidx.lifecycle.Lifecycle.State.RESUMED }
+            if (foregroundAndUnlocked() && assistantTurn.arm()) {
+                permissionDenied = false
+                startCapture()
+            }
+        }
+        // A denied/locked request must not remain eligible to record later.
+        if (assistantTurn.pending) assistantTurn.cancel()
+        onAutoStartConsumed()
+    }
+    androidx.compose.runtime.DisposableEffect(lifecycle) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            // A runtime permission dialog pauses but does not stop the chat.
+            // Leaving the app also cancels a not-yet-started request. Returning
+            // from Android settings requires another explicit invocation.
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP ||
+                (event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE && assistantTurn.armed)
+            ) {
+                if (assistantTurn.cancel()) SpeechRecognitionManager.cancelRecording()
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose {
+            lifecycle.removeObserver(observer)
+            assistantTurn.cancel()
+            // Also revoke the parent handoff: closing and reopening this panel
+            // during a suspended permission request is not a new invocation.
+            onAutoStartConsumed()
+        }
+    }
     LaunchedEffect(Unit) {
         providerRepository.ensureDefaultVoiceInputGroup()
         providerRepository.ensureDefaultVoiceOutputGroup()
@@ -606,6 +674,7 @@ fun InlineVoiceInputPanel(
                     onMicTap = { handleMicTap() },
                     onTranscriptChange = { setTranscript(it) },
                     onBeginEdit = {
+                        assistantTurn.cancel()
                         if (!isEditing) {
                             if (SpeechRecognitionManager.state.value != RecognitionState.IDLE) {
                                 SpeechRecognitionManager.cancelRecording()

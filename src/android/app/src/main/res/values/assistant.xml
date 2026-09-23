@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="assistant_settings_title">Default digital assistant</string>
+    <string name="assistant_settings_selected">Minis is your default assistant</string>
+    <string name="assistant_settings_choose">Choose Minis in Android settings</string>
+    <string name="assistant_settings_description">Use the system assistant button or gesture to open a new voice chat. On an unlocked phone, Minis requests microphone permission and sends the first completed utterance to your configured agent. Tap the microphone to take manual control. App-control permissions remain separate. Power-button behavior depends on your device settings.</string>
+    <string name="assistant_settings_unavailable">Open Android Settings → Apps → Default apps → Digital assistant app and choose Minis.</string>
+    <string name="assistant_unlock_first">Unlock your phone, then invoke Minis again.</string>
+</resources>

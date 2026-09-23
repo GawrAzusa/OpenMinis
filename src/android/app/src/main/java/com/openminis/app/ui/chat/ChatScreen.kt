@@ -533,6 +533,19 @@ fun ChatScreen(
 ) {
     val context = LocalContext.current
     val keyboardController = LocalSoftwareKeyboardController.current
+    // Never save a pending recording authorization. A recreated screen must
+    // require a fresh invocation, even if the previous permission UI was open.
+    var assistantAutoStart by remember(sessionId) {
+        mutableStateOf(com.openminis.app.assistant.AssistantLaunch.consume(sessionId))
+    }
+    LaunchedEffect(sessionId) {
+        if (assistantAutoStart) {
+            com.openminis.app.speech.SpeechRecognitionManager.cancelRecording()
+            com.openminis.app.speech.SpeechRecognitionManager.clearDegradationAndRefresh()
+            com.openminis.app.ui.chat.voice.VoiceModePrefs.enteredFromText = true
+            com.openminis.app.ui.chat.voice.VoiceModePrefs.isVoiceActive = true
+        }
+    }
     val focusManager = LocalFocusManager.current
     // Scoped to a process-level per-session ViewModelStore (ChatViewModelStore)
     // so the ViewModel and its viewModelScope survive:
@@ -5540,24 +5553,32 @@ fun ChatScreen(
                     // branch below only serves captures started OUTSIDE the
                     // panel (none today, kept as a safety net).
                     if (com.openminis.app.ui.chat.voice.VoiceModePrefs.isVoiceActive) {
-                        com.openminis.app.ui.chat.voice.InlineVoiceInputPanel(
-                            providerRepository = providerRepository,
-                            inputText = inputText,
-                            onInputTextChange = { text ->
-                                viewModel.setInputText(text)
-                                viewModel.updateSlashMenuState(text)
-                            },
-                            ensureMicPermission = { ensureMicPermissionFlow() },
-                            // [T-android-correction-context-wiring] Feed AI
-                            // correction the live conversation context. Reads the
-                            // FULL message list (not the windowed uiMessages) so
-                            // older turns still contribute rare-term grounding;
-                            // evaluated lazily at correction time.
-                            conversationContextProvider = {
-                                com.openminis.app.speech.correction.VoiceCorrection
-                                    .buildConversationContext(context, viewModel.messages.value)
-                            },
-                        )
+                        // Split-pane navigation reuses this composition for a
+                        // different chat. Dispose its capture and callbacks first;
+                        // an earlier utterance must never be sent to the new chat.
+                        androidx.compose.runtime.key(sessionId) {
+                            com.openminis.app.ui.chat.voice.InlineVoiceInputPanel(
+                                providerRepository = providerRepository,
+                                inputText = inputText,
+                                onInputTextChange = { text ->
+                                    viewModel.setInputText(text)
+                                    viewModel.updateSlashMenuState(text)
+                                },
+                                ensureMicPermission = { ensureMicPermissionFlow() },
+                                autoStartRequested = assistantAutoStart,
+                                onAutoStartConsumed = { assistantAutoStart = false },
+                                onAssistantRequest = { text -> performSendOrEnqueue(text) },
+                                // [T-android-correction-context-wiring] Feed AI
+                                // correction the live conversation context. Reads the
+                                // FULL message list (not the windowed uiMessages) so
+                                // older turns still contribute rare-term grounding;
+                                // evaluated lazily at correction time.
+                                conversationContextProvider = {
+                                    com.openminis.app.speech.correction.VoiceCorrection
+                                        .buildConversationContext(context, viewModel.messages.value)
+                                },
+                            )
+                        }
                     } else if (recIsRecording) {
                         val levels by com.openminis.app.speech.SpeechRecognitionManager
                             .audioLevels.collectAsState()
@@ -6239,7 +6260,11 @@ fun ChatScreen(
                             ) {
                                 com.openminis.app.deeplink.DeepLinkCoordinator
                                     .consumePendingChatAction()
-                                triggerVoiceInput()
+                                // Explicit voice entry must not toggle an
+                                // already-active voice panel off.
+                                if (!com.openminis.app.ui.chat.voice.VoiceModePrefs.isVoiceActive) {
+                                    triggerVoiceInput()
+                                }
                             }
                         }
 

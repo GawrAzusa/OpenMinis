@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="assistant_settings_title">默认数字助理</string>
+    <string name="assistant_settings_selected">Minis 已是默认数字助理</string>
+    <string name="assistant_settings_choose">在 Android 设置中选择 Minis</string>
+    <string name="assistant_settings_description">通过系统助理按钮或手势开启新语音会话。手机解锁后，Minis 会请求麦克风权限，将第一段完整识别的话语发送给已配置的智能体。点击麦克风可切回手动控制。操作其他应用仍需单独授权；长按电源键的行为取决于手机系统设置。</string>
+    <string name="assistant_settings_unavailable">请打开系统设置 → 应用 → 默认应用 → 数字助理应用，选择 Minis。</string>
+    <string name="assistant_unlock_first">请解锁手机后再次呼出 Minis。</string>
+</resources>

@@ -29,6 +29,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.openminis.app.offload.OffloadPermissionManager
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.rememberNavController
@@ -499,7 +500,12 @@ class MainActivity : ComponentActivity() {
         // while inside a chat, synthesise an OpenSession deep-link so
         // the navigation stack lands on that chat instead of the
         // sessions list. T166.
-        val explicitDeepLink = DeepLinkHandler.parse(intent?.data)
+        // A restored Activity must not replay an old assistant request or reopen
+        // the microphone after rotation/process death. A new onNewIntent still
+        // counts as a fresh, explicit user invocation.
+        val explicitDeepLink = if (savedInstanceState != null &&
+            com.openminis.app.assistant.AssistantLaunch.isAssistAction(intent?.action)
+        ) DeepLinkAction.Unknown else DeepLinkHandler.parseLaunch(intent?.action, intent?.data)
         val launchDeepLink = if (explicitDeepLink !is DeepLinkAction.Unknown) {
             explicitDeepLink
         } else {
@@ -699,6 +705,9 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        pendingAssistantLaunch?.cancel()
+        com.openminis.app.assistant.AssistantLaunch.cancelPending()
+        setIntent(intent)
         // T51: warm-start share — ShareReceiverActivity re-launches with
         // FLAG_ACTIVITY_CLEAR_TOP, which delivers the new intent here when
         // MainActivity is already alive. Process the buffered share before
@@ -706,13 +715,37 @@ class MainActivity : ComponentActivity() {
         if (intent.getBooleanExtra("shared_content", false)) {
             com.openminis.app.share.ShareCoordinator.processPendingShare(this)
         }
-        handleDeepLink(intent.data)
+        val action = DeepLinkHandler.parseLaunch(intent.action, intent.data)
+        if (action is DeepLinkAction.NewAssistantChat) {
+            // singleTask delivery may precede RESUMED/NavHost readiness. Keep
+            // only the newest invocation; do not drop a cold/warm startup race.
+            pendingAssistantLaunch = lifecycleScope.launch {
+                lifecycle.currentStateFlow.first { it == androidx.lifecycle.Lifecycle.State.RESUMED }
+                handleNavigationAction(action)
+            }
+        } else {
+            handleNavigationAction(action)
+        }
     }
 
-    private fun handleDeepLink(uri: Uri?) {
-        val action = DeepLinkHandler.parse(uri)
+    private var pendingAssistantLaunch: kotlinx.coroutines.Job? = null
+
+    override fun onStop() {
+        pendingAssistantLaunch?.cancel()
+        com.openminis.app.assistant.AssistantLaunch.cancelPending()
+        super.onStop()
+    }
+
+    private fun handleNavigationAction(action: DeepLinkAction) {
         val nav = navController ?: return
         when (action) {
+            is DeepLinkAction.NewAssistantChat -> {
+                val sessionId = com.openminis.app.assistant.AssistantLaunch.newSessionId()
+                nav.navigate(Routes.chat(sessionId)) {
+                    popUpTo(Routes.SESSION_LIST) { inclusive = false }
+                    launchSingleTop = true
+                }
+            }
             is DeepLinkAction.OpenTerminal -> {
                 nav.navigate(Routes.terminal(action.initCommand))
             }

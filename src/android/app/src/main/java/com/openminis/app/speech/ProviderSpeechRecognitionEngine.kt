@@ -503,6 +503,10 @@ class ProviderSpeechRecognitionEngine(private val appContext: Context) : SpeechR
     override fun cancel() {
         cancelled.set(true)
         recording.set(false)
+        // VAD owns a separate AudioRecord/capture job. Cancelling only the
+        // transcription coroutine leaves that microphone running after exit.
+        detector?.let { runCatching { it.cancel() } }
+        detector = null
         transcribeJob?.cancel()
         holdFlushJob?.cancel()
         holdFlushJob = null

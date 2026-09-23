@@ -192,6 +192,14 @@
             android:resizeableActivity="true"
             android:theme="@style/Theme.Minis"
             android:windowSoftInputMode="adjustResize">
+            <!-- Android's assistant role also supports an ACTION_ASSIST activity.
+                 No always-on microphone, hotword service or privileged permission
+                 is needed for an explicit button/gesture invocation. -->
+            <intent-filter>
+                <action android:name="android.intent.action.ASSIST" />
+                <action android:name="android.intent.action.VOICE_ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
             <!-- T-android-dynamic-app-icon: LAUNCHER intent-filter moved
                  to the <activity-alias> entries below so the user can pick
                  an alternate icon. Exactly one alias is enabled at a time

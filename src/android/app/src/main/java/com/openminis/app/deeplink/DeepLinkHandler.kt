@@ -66,6 +66,8 @@ sealed class DeepLinkAction {
     data object NewChat : DeepLinkAction()
     data object NewVoiceChat : DeepLinkAction()
     data object NewCameraChat : DeepLinkAction()
+    /** Explicit system assistant invocation, not an ordinary app/deep-link launch. */
+    data object NewAssistantChat : DeepLinkAction()
 
     /**
      * T183: any settings screen reachable by route string. Extends the
@@ -97,6 +99,14 @@ sealed class DeepLinkAction {
 }
 
 object DeepLinkHandler {
+    fun parseLaunch(action: String?, uri: Uri?): DeepLinkAction =
+        if (com.openminis.app.assistant.AssistantLaunch.isAssistAction(action)) {
+            // Do not interpret caller-supplied data/extras as commands or context.
+            DeepLinkAction.NewAssistantChat
+        } else {
+            parse(uri)
+        }
+
     fun parse(uri: Uri?): DeepLinkAction {
         if (uri == null || uri.scheme != "minis") return DeepLinkAction.Unknown
         val host = uri.host ?: return DeepLinkAction.Unknown
