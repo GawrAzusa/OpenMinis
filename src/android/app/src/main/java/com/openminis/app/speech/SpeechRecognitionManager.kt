@@ -278,15 +278,20 @@ object SpeechRecognitionManager {
         if (_state.value == RecognitionState.RECORDING || _state.value == RecognitionState.STARTING) {
             val cb = activeCallbacks
             if (cb != null) {
-                currentEngine()?.cancel()
-                setState(RecognitionState.IDLE)
-                startRecording(cb.first, cb.second)
+                val owner = activeCaptureOwner
+                cancelRecording()
+                startRecording(cb.first, cb.second, owner)
             }
         }
     }
 
     /** Callbacks from the most recent [startRecording] so [selectLocale] can restart with them. */
     private var activeCallbacks: Pair<(String, Boolean) -> Unit, (RecognitionError, String?) -> Unit>? = null
+    private var activeCaptureOwner: Any? = null
+    private var activeCaptureToken: Any? = null
+
+    /** Navigation transitions may keep two voice panels composed at once. */
+    fun isCaptureOwner(owner: Any): Boolean = activeCaptureOwner === owner
 
     fun availableEngines(): List<SpeechRecognitionEngine> = engines.toList()
 
@@ -315,6 +320,7 @@ object SpeechRecognitionManager {
     fun startRecording(
         onPartialOrFinal: (text: String, isFinal: Boolean) -> Unit,
         onError: (RecognitionError, String?) -> Unit,
+        owner: Any? = null,
     ) {
         if (_state.value != RecognitionState.IDLE) {
             Log.d(TAG, "startRecording ignored; state=${_state.value}")
@@ -337,6 +343,9 @@ object SpeechRecognitionManager {
         // racing the first audio frames.
         VoiceOutputState.suspendAllForCapture()
 
+        val captureToken = Any()
+        activeCaptureToken = captureToken
+        activeCaptureOwner = owner
         setState(RecognitionState.STARTING)
         _recognizedText.value = ""
         _lastError.value = null
@@ -345,23 +354,28 @@ object SpeechRecognitionManager {
 
         val listener = object : SpeechRecognitionEngine.Listener {
             override fun onReadyForSpeech() {
+                if (activeCaptureToken !== captureToken) return
                 setState(RecognitionState.RECORDING)
             }
 
             override fun onPartial(text: String) {
+                if (activeCaptureToken !== captureToken) return
                 _recognizedText.value = text
                 onPartialOrFinal(text, false)
             }
 
             override fun onFinal(text: String) {
+                if (activeCaptureToken !== captureToken) return
                 if (text.isNotEmpty()) _recognizedText.value = text
                 onPartialOrFinal(text, true)
+                if (activeCaptureToken !== captureToken) return
                 setState(RecognitionState.IDLE)
                 resetLevels()
                 refreshAvailability()
             }
 
             override fun onError(error: RecognitionError, message: String?) {
+                if (activeCaptureToken !== captureToken) return
                 _lastError.value = error
                 setState(RecognitionState.IDLE)
                 resetLevels()
@@ -369,12 +383,15 @@ object SpeechRecognitionManager {
                 refreshAvailability()
             }
 
-            override fun onRmsDb(rms: Float) { pushLevel(rms) }
+            override fun onRmsDb(rms: Float) {
+                if (activeCaptureToken === captureToken) pushLevel(rms)
+            }
         }
 
         try {
             engine.start(_locale.value, listener)
         } catch (e: Throwable) {
+            if (activeCaptureToken !== captureToken) return
             setState(RecognitionState.IDLE)
             _lastError.value = RecognitionError.UNKNOWN
             onError(RecognitionError.UNKNOWN, e.message)
@@ -388,6 +405,10 @@ object SpeechRecognitionManager {
     }
 
     fun cancelRecording() {
+        // Invalidate first: cancelling an engine can deliver a final/error event.
+        activeCaptureToken = null
+        activeCaptureOwner = null
+        activeCallbacks = null
         currentEngine()?.cancel()
         setState(RecognitionState.IDLE)
         _recognizedText.value = ""

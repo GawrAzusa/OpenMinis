@@ -193,6 +193,7 @@ fun InlineVoiceInputPanel(
     val sttState by SpeechRecognitionManager.state.collectAsState()
     val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
     val assistantTurn = remember { com.openminis.app.assistant.AssistantVoiceTurn() }
+    val captureOwner = remember { Any() }
     val currentAssistantRequest by androidx.compose.runtime.rememberUpdatedState(onAssistantRequest)
     val locale by SpeechRecognitionManager.locale.collectAsState()
     val supportedLocales by SpeechRecognitionManager.supportedLocales.collectAsState()
@@ -334,7 +335,15 @@ fun InlineVoiceInputPanel(
     }
 
     fun stopCapture() {
-        SpeechRecognitionManager.stopRecording()
+        if (SpeechRecognitionManager.isCaptureOwner(captureOwner)) {
+            SpeechRecognitionManager.stopRecording()
+        }
+    }
+
+    fun cancelCapture() {
+        if (SpeechRecognitionManager.isCaptureOwner(captureOwner)) {
+            SpeechRecognitionManager.cancelRecording()
+        }
     }
 
     fun startCapture() {
@@ -348,6 +357,7 @@ fun InlineVoiceInputPanel(
         captureBase = transcript
         transcribeError = null
         SpeechRecognitionManager.startRecording(
+            owner = captureOwner,
             // [T-android-vad] Commit only on a FINAL result.
             //
             // Previously every interim hypothesis was written straight into the
@@ -371,7 +381,7 @@ fun InlineVoiceInputPanel(
                     // Disarm before stopping: late/duplicate engine results must
                     // not submit a second task. Reuse the ordinary agent path.
                     scope.launch {
-                        SpeechRecognitionManager.cancelRecording()
+                        cancelCapture()
                         if (foregroundAndUnlocked()) currentAssistantRequest(request)
                     }
                 }
@@ -394,7 +404,7 @@ fun InlineVoiceInputPanel(
         when {
             isTranscribing -> {
                 // Spinner while idle → X cancels the in-flight transcription.
-                SpeechRecognitionManager.cancelRecording()
+                cancelCapture()
             }
             isRecording -> stopCapture()
             else -> scope.launch {
@@ -444,7 +454,7 @@ fun InlineVoiceInputPanel(
             if (event == androidx.lifecycle.Lifecycle.Event.ON_STOP ||
                 (event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE && assistantTurn.armed)
             ) {
-                if (assistantTurn.cancel()) SpeechRecognitionManager.cancelRecording()
+                if (assistantTurn.cancel()) cancelCapture()
             }
         }
         lifecycle.addObserver(observer)
@@ -473,11 +483,7 @@ fun InlineVoiceInputPanel(
         SpeechRecognitionManager.refreshSupportedLocales()
     }
     androidx.compose.runtime.DisposableEffect(Unit) {
-        onDispose {
-            if (SpeechRecognitionManager.state.value != RecognitionState.IDLE) {
-                SpeechRecognitionManager.cancelRecording()
-            }
-        }
+        onDispose { cancelCapture() }
     }
 
     // External input change (send clears it; "add reply to input") → sync back.
@@ -489,7 +495,7 @@ fun InlineVoiceInputPanel(
                 // A send emptied the composer → collapse to compact (iOS
                 // collapseAfterSendToken) and stop any live capture.
                 if (SpeechRecognitionManager.state.value != RecognitionState.IDLE) {
-                    SpeechRecognitionManager.cancelRecording()
+                    cancelCapture()
                 }
                 leaveEditMode()
                 persistExpanded(false)
@@ -677,7 +683,7 @@ fun InlineVoiceInputPanel(
                         assistantTurn.cancel()
                         if (!isEditing) {
                             if (SpeechRecognitionManager.state.value != RecognitionState.IDLE) {
-                                SpeechRecognitionManager.cancelRecording()
+                                cancelCapture()
                             }
                             editSnapshot = transcript
                             isEditing = true

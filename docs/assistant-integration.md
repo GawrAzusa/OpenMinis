@@ -21,7 +21,8 @@ Selecting the assistant does **not** grant OpenMinis permission to control other
 - Cold startup creates its navigation destination once with Compose `remember`. Warm single-task intents wait until the Activity is resumed; recreating an Activity does not replay its original assistant intent.
 - Pending microphone authorization is never saved across recreation. Leaving the screen/app also invalidates a request still waiting on permissions; returning from system settings requires a fresh assistant invocation. Recording starts only after the chat lifecycle is resumed, the device is unlocked and the microphone permission flow has succeeded. `AssistantVoiceTurn` rejects partial, blank, duplicate, cancelled and background results. The existing voice engine and agent submission handler are reused.
 - The ordinary voice shortcut is idempotent about entering voice mode rather than toggling an already-open panel off.
-- Assistant settings use `RoleManager` on Android 10+ with official settings fallbacks. Android 8/9 use the settings panel. Selection status is refreshed on return.
+- Assistant settings open the official system picker on all supported versions. Android 15 reports the assistant role as available but rejects `createRequestRoleIntent` as non-requestable; this implementation does not depend on that dialog. `RoleManager` is used only to read selection status on Android 10+, and status is refreshed on return.
+- Each voice panel owns its microphone capture. An outgoing panel in a navigation animation cannot cancel its successor's recording, and cancelled engine callbacks cannot update a replacement capture.
 
 ## Build and tests
 
@@ -67,5 +68,6 @@ JVM tests cover one-shot routing and voice-turn admission. Instrumented tests co
 - First version opens the normal Minis chat UI, not a Gemini-style floating overlay.
 - No wake-word/background listening or operation over the lock screen.
 - No claim that becoming the default assistant makes every OEM power key configurable.
+- The upstream native build produces 4KB-layout shared libraries. The translated 16KB Android emulator failed to load its Jieba library; the standard 4KB emulator does not have that failure. This candidate does not claim 16KB-device compatibility.
 - No upstream PR: the upstream mirror explicitly does not accept pull requests.
 - Source fork/branch archival is separate from binary distribution or release approval. Builds remain INTERNAL / UNPUBLISHED until explicitly approved for a stated target and audience.
