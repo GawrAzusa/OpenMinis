@@ -742,8 +742,14 @@ class MainActivity : ComponentActivity() {
             is DeepLinkAction.NewAssistantChat -> {
                 val sessionId = com.openminis.app.assistant.AssistantLaunch.newSessionId()
                 nav.navigate(Routes.chat(sessionId)) {
-                    popUpTo(Routes.SESSION_LIST) { inclusive = false }
-                    launchSingleTop = true
+                    // A cold assistant launch starts NavHost directly at CHAT,
+                    // so SESSION_LIST may not be on the stack. SingleTop would
+                    // reuse that chat's saved pane selection with the OLD draft
+                    // id, preventing the new invocation token from being claimed.
+                    // Rebuild the destination; the pane navigator still provides
+                    // its own list/back behavior and no chat data is deleted.
+                    popUpTo(nav.graph.id) { inclusive = false }
+                    launchSingleTop = false
                 }
             }
             is DeepLinkAction.OpenTerminal -> {
