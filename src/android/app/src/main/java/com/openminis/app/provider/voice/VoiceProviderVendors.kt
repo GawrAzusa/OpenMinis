@@ -450,7 +450,7 @@ class XunfeiVoiceProvider(
 
 /**
  * Gemini TTS is NOT OpenAI-compatible: POST {base}/v1beta/models/{model}:
- * generateContent with the key in ?key= and base64 raw PCM (24 kHz mono) in
+ * generateContent with the key in x-goog-api-key and base64 raw PCM (24 kHz mono) in
  * candidates[0].content.parts[].inlineData.data. Wrap the PCM in WAV.
  */
 class GeminiVoiceProvider(providerId: String, baseURL: String, apiKey: String?) :
@@ -477,7 +477,7 @@ class GeminiVoiceProvider(providerId: String, baseURL: String, apiKey: String?) 
         val model = request.model ?: defaultVoiceOutputModel()
         var base = effectiveBaseURL()
         if (!base.contains("/v1beta")) base = base.trimEnd('/') + "/v1beta"
-        val url = "$base/models/$model:generateContent?key=${apiKey ?: ""}"
+        val url = "$base/models/$model:generateContent"
         val body = JSONObject()
             .put(
                 "contents",
@@ -502,6 +502,7 @@ class GeminiVoiceProvider(providerId: String, baseURL: String, apiKey: String?) 
             )
         return Request.Builder()
             .url(url)
+            .header("x-goog-api-key", apiKey ?: "")
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
     }

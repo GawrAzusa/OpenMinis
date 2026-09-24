@@ -63,8 +63,9 @@ object AssistantWorkspace {
         ))[ChatViewModel::class.java]
         recorder = AssistantAudioRecorder(application)
         VoiceOutputState.init(application)
-        speaker = ReadAloudPlayer(application)
+        speaker = ReadAloudPlayer(application, allowSystemFallback = false)
         val model = vm!!
+        model.enableAssistantContext()
         observers = scope.launch {
             launch {
                 var wasBusy = false

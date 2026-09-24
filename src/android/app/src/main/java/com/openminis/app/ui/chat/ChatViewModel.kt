@@ -1148,6 +1148,10 @@ class ChatViewModel(
     private var assistantResumeSetupJob: Job? = null
     @Volatile private var assistantTaskPaused = false
     private var currentProvider: LLMProvider? = null
+    private var assistantContextEnabled = false
+
+    /** Only the native assistant workspace opts in; ordinary chat prompts stay unchanged. */
+    internal fun enableAssistantContext() { assistantContextEnabled = true }
     private var currentModel: LLMModel? = null
 
     /**
@@ -5343,14 +5347,9 @@ class ChatViewModel(
      */
     fun retryFromMessage(messageId: String) {
         if (_isStreaming.value) return
-        _canResume.value = false
         val messages = _messages.value
         val index = messages.indexOfFirst { it.id == messageId }
-        if (index < 0) return
-        val message = messages[index]
-        // [T-android-tool-autoscroll] Start-of-turn snap — see resume().
-        _forceScrollToBottom.tryEmit(Unit)
-        if (message.role != "user" || message.content.isBlank()) return
+        if (index < 0 || messages[index].role != "user") return
 
         val initialProvider = currentProvider
         if (initialProvider == null) {
@@ -5359,36 +5358,6 @@ class ChatViewModel(
         }
         val provider: LLMProvider = initialProvider
         _error.value = null
-
-        // T149: snapshot messages about to be truncated so we can revoke any
-        // memory_write tool blocks they contain. Without this, a retry leaves
-        // the on-disk daily log with entries the user has just rewound past.
-        val deletedMessages = messages.subList(index + 1, messages.size).toList()
-
-        // Truncate UI messages: keep up to and including this user message.
-        // T189: if the retried bubble was still in the queued state (manual
-        // retry of a queued message before resumeQueueAfterCancel's grace
-        // window — or fallback when auto-resume is disabled), flip it out of
-        // queued visuals and drop its queue entry so the upcoming send
-        // doesn't double up against a later auto-drain.
-        val retainedHead = messages.subList(0, index + 1).map { m ->
-            if (m.id == messageId && m.isQueued) {
-                m.queuedPromptId?.let { pid ->
-                    _promptQueue.value = _promptQueue.value.filterNot { it.id == pid }
-                }
-                m.copy(isQueued = false, queuedPromptId = null)
-            } else m
-        }
-        _messages.value = retainedHead
-        // T-streaming-side-channel: scrub stream deltas pointing at
-        // messages we just truncated so they can't resurface later.
-        val keptIds = retainedHead.mapTo(mutableSetOf()) { it.id }
-        retainStreamFlushStates(keptIds)
-        if (_streamingById.value.isNotEmpty()) {
-            _streamingById.value = _streamingById.value.filterKeys { it in keptIds }
-        }
-
-        revokeMemoryWritesInDeletedMessages(deletedMessages)
 
         // T145: claim the streaming flag SYNCHRONOUSLY so a rapid second tap
         // (or any concurrent send/retry attempt) is rejected by the entry
@@ -5406,56 +5375,61 @@ class ChatViewModel(
             // unhappy paths; happy path resets in the streamJob's tail.
             var streamLaunched = false
             try {
-            val sid = realSessionId.takeIf { it.isNotEmpty() } ?: sessionId
+                val sid = realSessionId.takeIf { it.isNotEmpty() } ?: sessionId
 
-            // Find the DB sort_order cutoff for this user message.
-            // UI visible user messages are the N-th user msg with actual text content.
-            // Count which visible user message this is (0-based).
-            val visibleUserIndex = messages.subList(0, index + 1).count { it.role == "user" } - 1
-            val dbMessages = chatRepository.loadMessages(sid)
-            // Walk DB rows, counting visible user messages (those with non-toolResult text)
-            var visibleUserCount = 0
-            var cutoffSortOrder = -1
-            for (entity in dbMessages) {
-                if (entity.role == "user") {
-                    // Check if this user message has visible text (not toolResult-only).
-                    // [T-ios-retry-anchor-synthetic-user] Synthetic user rows the
-                    // agent loop persists WITHOUT a UI bubble — resume()'s
-                    // stop-continue "<system-reminder>" message — must not count,
-                    // or the cutoff anchors one user message too early and the
-                    // retried bubble (plus the whole last turn) is silently
-                    // dropped from the rebuilt history (mirrors the iOS fix).
-                    val hasText = try {
-                        val arr = org.json.JSONArray(entity.partsJson)
-                        (0 until arr.length()).any { i ->
-                            val o = arr.getJSONObject(i)
-                            val v = o.optString("value", "")
-                            o.optString("type") == "text" && v.isNotBlank() &&
-                                !v.trimStart().startsWith("<system-reminder>")
-                        }
-                    } catch (_: Exception) { true }
-                    if (hasText) {
-                        if (visibleUserCount == visibleUserIndex) {
-                            cutoffSortOrder = entity.sortOrder + 1
-                            break
-                        }
-                        visibleUserCount++
-                    }
+                val dbMessages = chatRepository.loadMessages(sid)
+                // Resolve the exact original row BEFORE changing DB, UI, queue or memory.
+                // Labels and visible-user ordinals are not persisted request identities.
+                val cutoffSortOrder = com.openminis.app.assistant.AssistantAudioRetryPolicy.retryCutoff(
+                    dbMessages, messageId,
+                ) ?: run {
+                    _error.value = "The original request is missing or cannot be retried."
+                    return@launch
                 }
-            }
-            if (cutoffSortOrder >= 0) {
                 chatRepository.deleteMessagesAfter(sid, cutoffSortOrder)
-            }
+                _canResume.value = false
+                // [T-android-tool-autoscroll] Snap only after retry validation succeeds.
+                _forceScrollToBottom.tryEmit(Unit)
 
-            // Rebuild agentHistory from remaining DB messages
-            agentHistory.clear()
-            toolLoopDetector.reset()
-            val remaining = chatRepository.loadMessages(sid)
-            for (entity in remaining) {
-                agentHistory.add(entity.toLLMMessage())
-            }
+                // T149: snapshot messages about to be truncated so we can revoke any
+                // memory_write tool blocks they contain. Without this, a retry leaves
+                // the on-disk daily log with entries the user has just rewound past.
+                val deletedMessages = messages.subList(index + 1, messages.size).toList()
 
-            streamLaunched = runRerunStreamTail(provider, "retryFromMessage")
+                // Truncate UI messages: keep up to and including this user message.
+                // T189: if the retried bubble was still in the queued state (manual
+                // retry of a queued message before resumeQueueAfterCancel's grace
+                // window — or fallback when auto-resume is disabled), flip it out of
+                // queued visuals and drop its queue entry so the upcoming send
+                // doesn't double up against a later auto-drain.
+                val retainedHead = messages.subList(0, index + 1).map { m ->
+                    if (m.id == messageId && m.isQueued) {
+                        m.queuedPromptId?.let { pid ->
+                            _promptQueue.value = _promptQueue.value.filterNot { it.id == pid }
+                        }
+                        m.copy(isQueued = false, queuedPromptId = null)
+                    } else m
+                }
+                _messages.value = retainedHead
+                // T-streaming-side-channel: scrub stream deltas pointing at
+                // messages we just truncated so they can't resurface later.
+                val keptIds = retainedHead.mapTo(mutableSetOf()) { it.id }
+                retainStreamFlushStates(keptIds)
+                if (_streamingById.value.isNotEmpty()) {
+                    _streamingById.value = _streamingById.value.filterKeys { it in keptIds }
+                }
+
+                revokeMemoryWritesInDeletedMessages(deletedMessages)
+
+                // Rebuild agentHistory from remaining DB messages
+                agentHistory.clear()
+                toolLoopDetector.reset()
+                val remaining = chatRepository.loadMessages(sid)
+                for (entity in remaining) {
+                    agentHistory.add(entity.toLLMMessage())
+                }
+
+                streamLaunched = runRerunStreamTail(provider, "retryFromMessage")
             } finally {
                 if (!streamLaunched) {
                     AppLogger.info(TAG_STREAM, "retry _isStreaming=false (setup aborted)")
@@ -6293,10 +6267,13 @@ class ChatViewModel(
 
     /** Pause, retaining queued prompts but preventing automatic queue restarts. */
     fun pauseAssistantTask() {
+        // Hiding an idle assistant must not mark an already completed answer as
+        // interrupted (or offer to resume/repeat an operation that has finished).
+        val hadActiveStream = _isStreaming.value
         assistantTaskPaused = true
         assistantSendSetupJob?.cancel()
         assistantResumeSetupJob?.cancel()
-        cancelStream()
+        if (hadActiveStream) cancelStream()
     }
 
     fun assistantAudioUnavailableReason(): String? =
@@ -10198,7 +10175,8 @@ class ChatViewModel(
         // has no personality body, identitySection() returns the identity
         // sentence with its original single trailing space — the full
         // assembled prompt then matches the pre-SOUL prompt byte-for-byte.
-        val identitySection = com.openminis.app.agent.SystemPromptBuilder.identitySection(context)
+        val identitySection = (if (assistantContextEnabled) com.openminis.app.assistant.AssistantTaskGuidance.text else "") +
+            com.openminis.app.agent.SystemPromptBuilder.identitySection(context)
         // [T-memory-toggle-gates-injection-and-tools-android] Mirror the iOS
         // gate: when memory is disabled for this session, replace the
         // "memory_write / memory_get" tool bullets and the "Memory system:"
@@ -12201,6 +12179,12 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 text = "(message could not be parsed: ${e.javaClass.simpleName}, " +
                     "${entity.partsJson.length} bytes)"
             }
+
+            // A valid captionless recording needs a selectable persisted-ID bubble after reload.
+            // This label is UI-only; toLLMMessage() still restores the exact original audio.
+            text = com.openminis.app.assistant.AssistantAudioRetryPolicy.restoreUserText(
+                entity.role, entity.partsJson, text,
+            )
 
             // Skip user messages with no visible content (toolResult-only internal messages,
             // or messages that were entirely a system-reminder). A user message that is

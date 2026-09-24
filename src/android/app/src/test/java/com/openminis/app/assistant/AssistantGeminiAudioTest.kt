@@ -26,12 +26,13 @@ class AssistantGeminiAudioTest {
     private val wav = AssistantAudioSupport.wav(byteArrayOf(0, 0, 1, 0, -1, -1))
     private val audio = AssistantAudioSupport.part(wav)
     private lateinit var server: MockWebServer
+    private val fixtureCredential = java.util.UUID.randomUUID().toString()
     private lateinit var provider: GeminiProvider
 
     @Before fun setUp() {
         server = MockWebServer()
         server.start()
-        provider = GeminiProvider("local-fixture", model,
+        provider = GeminiProvider(fixtureCredential, model,
             basePath = server.url("/v1beta").toString().trimEnd('/'))
     }
 
@@ -44,9 +45,31 @@ class AssistantGeminiAudioTest {
         provider.model = model.copy(inputModalities = listOf("text", "image"))
         assertNotNull(AssistantAudioSupport.unavailableReason(provider))
         assertNotNull(AssistantAudioSupport.unavailableReason(null))
-        assertNull(AssistantAudioSupport.unavailableReason(OpenAIProvider("local-fixture", model)))
+        assertNull(AssistantAudioSupport.unavailableReason(OpenAIProvider(fixtureCredential, model)))
         assertNotNull(AssistantAudioSupport.unavailableReason(
-            OpenAIProvider("local-fixture", model, useResponsesAPI = true)))
+            OpenAIProvider(fixtureCredential, model, useResponsesAPI = true)))
+    }
+
+    @Test fun nativeAudioToolsUseValidatedModeWithoutForcingActions() = runBlocking {
+        enqueueReply()
+        provider.sendMessage(listOf(LLMMessage(LLMMessage.Role.USER, "", audioParts = listOf(audio))),
+            null, 100, tools = listOf(com.openminis.app.data.model.AgentToolDefinition("shell_execute", "Execute", emptyMap())))
+        val body = JSONObject(server.takeRequest(5, TimeUnit.SECONDS)!!.body.readUtf8())
+        assertEquals("VALIDATED", body.getJSONObject("toolConfig").getJSONObject("functionCallingConfig").getString("mode"))
+        assertEquals("shell_execute", body.getJSONArray("tools").getJSONObject(0).getJSONArray("function_declarations").getJSONObject(0).getString("name"))
+    }
+
+    @Test fun textOnlyToolsKeepExistingMode() = runBlocking {
+        enqueueReply()
+        provider.sendMessage(listOf(LLMMessage(LLMMessage.Role.USER, "hello")), null, 100,
+            tools = listOf(com.openminis.app.data.model.AgentToolDefinition("shell_execute", "Execute", emptyMap())))
+        assertFalse(JSONObject(server.takeRequest(5, TimeUnit.SECONDS)!!.body.readUtf8()).has("toolConfig"))
+    }
+
+    @Test fun audioWithoutToolsDoesNotEnableFunctionCalling() = runBlocking {
+        enqueueReply()
+        provider.sendMessage(listOf(LLMMessage(LLMMessage.Role.USER, "", audioParts = listOf(audio))), null, 100)
+        assertFalse(JSONObject(server.takeRequest(5, TimeUnit.SECONDS)!!.body.readUtf8()).has("toolConfig"))
     }
 
     @Test fun audioOnlyUsesGenerateContentWithOriginalWav() = runBlocking {
@@ -146,6 +169,9 @@ class AssistantGeminiAudioTest {
         assertEquals("/v1beta/models/${model.id}:${if (stream) "streamGenerateContent" else "generateContent"}",
             request.requestUrl!!.encodedPath)
         if (stream) assertEquals("sse", request.requestUrl!!.queryParameter("alt"))
+        assertEquals(fixtureCredential, request.getHeader("x-goog-api-key"))
+        assertNull(request.requestUrl!!.queryParameter("key"))
+        assertFalse(request.requestUrl.toString().contains(fixtureCredential))
         return JSONObject(request.body.readUtf8()).getJSONArray("contents")
     }
 

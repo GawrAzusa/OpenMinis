@@ -11,21 +11,22 @@ import com.openminis.app.R
 import com.openminis.app.logging.AppLogger
 import com.openminis.app.provider.voice.VoiceOutputRequest
 import com.openminis.app.provider.voice.VoiceProviderFactory
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
 /**
  * [T-android-provider-tts-readaloud] Read-aloud playback that routes through
@@ -41,12 +42,13 @@ import kotlin.coroutines.resume
  * ## Routing
  * Each utterance asks [com.openminis.app.data.repository.ProviderRepository
  * .resolveVoiceOutputChoice] (added in the P0-1 commit) where to go:
- *  - System choice, no credentials, unsupported vendor, or ANY synthesis
- *    failure → [TextToSpeechManager] (the on-device engine).
+ *  - System choice → [TextToSpeechManager] (the on-device engine).
+ *  - Provider credentials, synthesis or playback failure → system fallback
+ *    unless [allowSystemFallback] is false, in which case report unavailable.
  *  - Provider choice → `synthesize()` then play the returned bytes.
  *
- * Fallback is per-utterance and silent by design: a mid-reply network blip
- * degrades to the device voice rather than dropping the sentence.
+ * Fallback is per-utterance by default. Assistant callers can disable system
+ * fallback after a provider failure, keeping the selected voice honest.
  *
  * ## Ordering
  * Utterances go through a [Channel] consumed by a single worker coroutine, so
@@ -61,14 +63,24 @@ import kotlin.coroutines.resume
  *
  * Not thread-safe beyond the channel; call from the main thread.
  */
-class ReadAloudPlayer(context: Context) {
+class ReadAloudPlayer(
+    context: Context,
+    private val allowSystemFallback: Boolean = true,
+) {
 
     private val appContext = context.applicationContext
     private val system = TextToSpeechManager().also { it.init(appContext) }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
-    private val queue = Channel<String>(Channel.UNLIMITED)
-    private var worker: Job? = null
+    private val lifecycle = ReadAloudSynthesisLifecycle(
+        scope = scope,
+        onPendingChanged = { count ->
+            _isSpeaking.value = count > 0
+            if (ownsCapsule()) VoiceOutputState.isSpeaking.value = count > 0
+        },
+        onFailure = { AppLogger.error(TAG, "utterance failed: $it") },
+        speak = { text, lease -> speakOne(text, lease) },
+    )
 
     /** Currently playing provider audio, if any — held so [stop] can cancel it. */
     private var player: MediaPlayer? = null
@@ -89,9 +101,6 @@ class ReadAloudPlayer(context: Context) {
      */
     @Volatile
     private var progressListenerBroken = false
-
-    /** Utterances enqueued but not yet finished; drives [isSpeaking]. */
-    private val pending = AtomicInteger(0)
 
     /**
      * [T-android-tts-player-registry] True when THIS player owns the capsule.
@@ -146,18 +155,6 @@ class ReadAloudPlayer(context: Context) {
         // live speaking flag into the global state the capsule renders from.
         VoiceOutputState.init(appContext)
         VoiceOutputState.registerPlayer(this)
-        worker = scope.launch {
-            for (text in queue) {
-                runCatching { speakOne(text) }
-                    .onFailure { AppLogger.error(TAG, "utterance failed: $it") }
-                // Queue drained → speech is over. Counter rather than
-                // Channel.isEmpty, which is experimental API.
-                if (pending.decrementAndGet() <= 0) {
-                    _isSpeaking.value = false
-                    if (ownsCapsule()) VoiceOutputState.isSpeaking.value = false
-                }
-            }
-        }
     }
 
     /**
@@ -234,10 +231,8 @@ class ReadAloudPlayer(context: Context) {
         // fenced code block) sanitizes to empty and must not occupy the queue.
         val clean = VoiceTextSanitizer.sanitize(raw, linkPhrases)
         if (clean.isBlank()) return
-        pending.incrementAndGet()
-        _isSpeaking.value = true
-        if (ownsCapsule()) VoiceOutputState.isSpeaking.value = true
-        queue.trySend(clean)
+        if (capturePaused) return
+        lifecycle.enqueue(clean)
     }
 
     /**
@@ -246,7 +241,7 @@ class ReadAloudPlayer(context: Context) {
      * back up.
      *
      * Distinct from [stop], which drops the queue: this is a pause, not a
-     * cancel. The utterance that is mid-playback is abandoned (there is no
+     * cancel. The active utterance (synthesizing or playing) is abandoned (there is no
      * seek-within-utterance on either engine, and re-speaking a whole paragraph
      * to recover two words is worse than losing them), but everything still
      * queued behind it is preserved and re-queued on resume.
@@ -255,11 +250,7 @@ class ReadAloudPlayer(context: Context) {
         if (capturePaused) return
         capturePaused = true
         // Drain into the holding list rather than onto the floor.
-        val held = mutableListOf<String>()
-        while (true) {
-            val r = queue.tryReceive()
-            if (r.isSuccess) held.add(r.getOrThrow()) else break
-        }
+        val held = lifecycle.reset().toMutableList()
         // The un-terminated tail counts as pending speech too.
         val tail = sentenceBuffer.toString().trim()
         sentenceBuffer.setLength(0)
@@ -269,7 +260,6 @@ class ReadAloudPlayer(context: Context) {
         playbackFinisher?.invoke()
         releasePlayer()
         system.stop()
-        pending.set(0)
         _isSpeaking.value = false
         if (ownsCapsule()) {
             VoiceOutputState.isSpeaking.value = false
@@ -298,26 +288,22 @@ class ReadAloudPlayer(context: Context) {
         capturePaused = false
         heldForCapture.clear()
         sentenceBuffer.setLength(0)
-        while (queue.tryReceive().isSuccess) { /* drain */ }
-        // Unblock the worker BEFORE releasing, so the in-flight utterance's
-        // suspension completes instead of waiting on callbacks that a released
-        // MediaPlayer will never deliver.
+        // Revoke old work before cancellation/cleanup; replacement speech never
+        // waits for a provider request (or its finally block) to finish.
+        lifecycle.reset()
         playbackFinisher?.invoke()
         releasePlayer()
         system.stop()
-        pending.set(0)
         _isSpeaking.value = false
         if (ownsCapsule()) {
             VoiceOutputState.isSpeaking.value = false
-            if (ownsCapsule()) VoiceOutputState.isSynthesizing.value = false
+            VoiceOutputState.isSynthesizing.value = false
         }
     }
 
     /** Release both engines. Call from the owner's DisposableEffect. */
     fun shutdown() {
         stop()
-        worker?.cancel()
-        queue.close()
         scope.cancel()
         system.shutdown()
         // Deregister by identity: removing a mid-stack player leaves the rest
@@ -328,11 +314,28 @@ class ReadAloudPlayer(context: Context) {
 
     // -- internals --
 
-    private suspend fun speakOne(text: String) {
+    private suspend fun checkCurrent(lease: ReadAloudSynthesisLifecycle.Lease) {
+        currentCoroutineContext().ensureActive()
+        lease.ensureCurrent()
+    }
+
+    private suspend fun speakOne(text: String, lease: ReadAloudSynthesisLifecycle.Lease) {
+        checkCurrent(lease)
         val entry = runCatching {
             (appContext as? MinisApp)?.providerRepository?.resolveVoiceOutputEntry()
-        }.getOrNull()
+        }.getOrElse {
+            if (it is CancellationException) throw it
+            checkCurrent(lease)
+            if (!allowSystemFallback) {
+                // An unresolved selection is not permission to change engines.
+                _outputRoute.value = OutputRoute("unavailable")
+                notifySpeechUnavailable(providerConfigured = false)
+                return
+            }
+            null
+        }
 
+        checkCurrent(lease)
         if (entry != null) {
             val (instance, modelEntry) = entry
             // [T-android-tts-capsule] Surface the ACTUALLY-synthesizing model
@@ -343,21 +346,30 @@ class ReadAloudPlayer(context: Context) {
                     modelEntry.model.displayName.ifBlank { modelEntry.model.id }
             }
             _outputRoute.value = OutputRoute("provider", modelEntry.model.displayName.ifBlank { modelEntry.model.id })
-            val ok = runCatching { speakViaProvider(instance, modelEntry, text) }
+            val ok = runCatching { speakViaProvider(instance, modelEntry, text, lease) }
                 .getOrElse {
                     if (it is kotlinx.coroutines.CancellationException) throw it
+                    checkCurrent(lease)
                     AppLogger.error(
                         TAG,
                         "provider TTS failed (model=${modelEntry.model.id} " +
-                            "vendor=${instance.providerType}), falling back to system engine: $it",
+                            "vendor=${instance.providerType}, allowSystemFallback=$allowSystemFallback): $it",
                     )
                     false
                 }
+            checkCurrent(lease)
             if (ok) return
+            if (!allowSystemFallback) {
+                _outputRoute.value = OutputRoute("unavailable", _outputRoute.value.modelLabel)
+                notifySpeechUnavailable(providerConfigured = true)
+                return
+            }
         }
         if (ownsCapsule()) VoiceOutputState.activeModelLabel.value = null // system engine
         _outputRoute.value = OutputRoute("system", fallback = entry != null)
-        if (!speakViaSystem(text)) {
+        val systemOk = speakViaSystem(text, lease)
+        checkCurrent(lease)
+        if (!systemOk) {
             _outputRoute.value = OutputRoute("unavailable", fallback = entry != null)
             // [T-android-tts-silent-blackhole] Terminal state: the provider path
             // did not produce audio AND the device speech engine is unusable.
@@ -375,8 +387,8 @@ class ReadAloudPlayer(context: Context) {
     private fun notifySpeechUnavailable(providerConfigured: Boolean) {
         AppLogger.error(
             TAG,
-            "read-aloud produced NO audio: providerConfigured=$providerConfigured " +
-                "systemEngine=${if (system.initFailed) "init-failed" else "unavailable"}",
+            "read-aloud did not complete: providerConfigured=$providerConfigured " +
+                "allowSystemFallback=$allowSystemFallback",
         )
         if (unavailableNotified) return
         unavailableNotified = true
@@ -393,6 +405,7 @@ class ReadAloudPlayer(context: Context) {
         instance: com.openminis.app.data.model.ProviderInstance,
         modelEntry: com.openminis.app.data.model.ModelEntry,
         text: String,
+        lease: ReadAloudSynthesisLifecycle.Lease,
     ): Boolean {
         // [T-android-safemode-lateinit-crash-147] `?.` guards a null
         // Application but NOT an unassigned lateinit — the getter throws.
@@ -407,6 +420,7 @@ class ReadAloudPlayer(context: Context) {
             ?: return false.also { AppLogger.error(TAG, "provider TTS skipped: repository unavailable") }
         val apiKey = repo.loadApiKey(instance.id)
             ?: return false.also { AppLogger.error(TAG, "provider TTS skipped: no API key for ${instance.id}") }
+        checkCurrent(lease)
         val voice = VoiceProviderFactory.make(instance, apiKey)
             ?: return false.also { AppLogger.error(TAG, "provider TTS skipped: no voice adapter for ${instance.providerType}/${instance.customBaseURL}") }
         if (!voice.supportsVoiceOutput) {
@@ -432,13 +446,14 @@ class ReadAloudPlayer(context: Context) {
                 )
             }
         } finally {
-            VoiceOutputState.isSynthesizing.value = false
+            if (lease.isCurrent && ownsCapsule()) VoiceOutputState.isSynthesizing.value = false
         }
+        checkCurrent(lease)
         if (data.isEmpty()) {
             AppLogger.error(TAG, "provider TTS returned empty audio (model=${modelEntry.model.id})")
             return false
         }
-        playBytes(data)
+        playBytes(data, lease)
         return true
     }
 
@@ -446,24 +461,37 @@ class ReadAloudPlayer(context: Context) {
      * Write [data] to a cache file and play it to completion. Same approach as
      * QuickTestSheet — MediaPlayer needs a file/descriptor, not a byte array.
      */
-    private suspend fun playBytes(data: ByteArray) {
-        val file = withContext(Dispatchers.IO) {
-            File(appContext.cacheDir, "readaloud_tts.audio").apply { writeBytes(data) }
+    private suspend fun playBytes(data: ByteArray, lease: ReadAloudSynthesisLifecycle.Lease) {
+        // Per-utterance file: canceled IO must not overwrite replacement audio.
+        val file = File.createTempFile("readaloud_tts", ".audio", appContext.cacheDir)
+        try {
+            withContext(Dispatchers.IO) { file.writeBytes(data) }
+            checkCurrent(lease)
+            playFile(file)
+        } finally {
+            file.delete()
         }
+    }
+
+    private suspend fun playFile(file: File) {
         suspendCancellableCoroutine { cont ->
             val mp = MediaPlayer()
             player = mp
             var resumed = false
-            fun finish() {
+            fun finish(failure: Throwable? = null) {
                 if (resumed) return
                 resumed = true
-                playbackFinisher = null
-                releasePlayer()
-                if (cont.isActive) cont.resume(Unit)
+                if (player === mp) {
+                    playbackFinisher = null
+                    releasePlayer()
+                }
+                if (cont.isActive) {
+                    if (failure == null) cont.resume(Unit)
+                    else cont.resumeWithException(failure)
+                }
             }
-            // Let stop()/shutdown() complete this suspension after releasing
-            // the player, since the callbacks below can no longer fire.
-            playbackFinisher = ::finish
+            // Explicit stop is cancellation, never successful speech or fallback.
+            playbackFinisher = { finish(CancellationException("Speech playback stopped")) }
             runCatching {
                 // [T-android-tts-silent-blackhole] Explicit attributes + audio
                 // focus. iOS routes playback through AudioSessionCoordinator;
@@ -476,7 +504,7 @@ class ReadAloudPlayer(context: Context) {
                 mp.setOnCompletionListener { finish() }
                 mp.setOnErrorListener { _, what, extra ->
                     AppLogger.error(TAG, "MediaPlayer error what=$what extra=$extra")
-                    finish()
+                    finish(IllegalStateException("MediaPlayer error what=$what extra=$extra"))
                     true
                 }
                 mp.prepare()
@@ -499,9 +527,11 @@ class ReadAloudPlayer(context: Context) {
                 }
             }.onFailure {
                 AppLogger.error(TAG, "MediaPlayer setup failed: $it")
-                finish()
+                finish(it)
             }
-            cont.invokeOnCancellation { releasePlayer() }
+            cont.invokeOnCancellation {
+                finish(CancellationException("Speech playback cancelled"))
+            }
         }
     }
 
@@ -541,11 +571,12 @@ class ReadAloudPlayer(context: Context) {
      * @return false when the engine is unusable (init failed / never bound) —
      *   the caller surfaces that instead of pretending the sentence was spoken.
      */
-    private suspend fun speakViaSystem(text: String): Boolean {
+    private suspend fun speakViaSystem(text: String, lease: ReadAloudSynthesisLifecycle.Lease): Boolean {
         // [T-android-tts-silent-blackhole] Engine binding is async; speaking
         // before it settles used to drop the text on the floor. Wait (bounded)
         // for a verdict first.
         if (!system.awaitReady()) return false
+        checkCurrent(lease)
         // [T-android-tts-capsule] Apply the capsule's speed each utterance —
         // the property setter forwards to tts.setSpeechRate, so mid-reply
         // speed changes take effect from the next sentence.
@@ -621,9 +652,10 @@ class ReadAloudPlayer(context: Context) {
         (text.length * 90L + 400L).coerceIn(600L, 30_000L)
 
     private fun releasePlayer() {
-        player?.runCatching {
-            if (isPlaying) stop()
-            release()
+        player?.let { mp ->
+            // isPlaying/stop can throw in the error state; still release resources.
+            runCatching { if (mp.isPlaying) mp.stop() }
+            runCatching { mp.release() }
         }
         player = null
         abandonAudioFocus()

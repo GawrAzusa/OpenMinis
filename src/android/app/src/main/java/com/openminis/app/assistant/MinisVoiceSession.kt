@@ -84,7 +84,7 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
 
     override fun onCreateContentView(): View {
         root = FrameLayout(context).apply {
-            setBackgroundColor(Color.TRANSPARENT)
+            background = AssistantWindowBackground()
             setOnClickListener { minimize() }
         }
         // Android 15 enforces edge-to-edge even for voice sessions: adjustResize alone
@@ -331,10 +331,11 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
         if (android.os.Build.VERSION.SDK_INT >= 33 && context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED) {
             AssistantPermissionActivity.open(context, "notifications"); hide(); return
         }
-        if (AssistantWorkspace.imageUnavailableReason() != null) {
-            // Capturing locally remains useful even with no configured vision model.
-            AssistantWorkspace.error("截图仅本地预览；发送前需要支持看图的模型。")
-        }
+        // This is a new explicit capture attempt: do not retain a previous
+        // consent denial alongside the new, successfully captured preview.
+        AssistantWorkspace.error(if (AssistantWorkspace.imageUnavailableReason() != null) {
+            "截图仅本地预览；发送前需要支持看图的模型。"
+        } else null)
         captureTicket = AssistantReturnGate.beginTemporary()
         awaitingCapture = true
         AssistantWorkspace.discardPreview()

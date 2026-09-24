@@ -24,6 +24,8 @@ fun customizationValue(key: String): String =
 
 android {
     namespace = "com.openminis.app"
+    // Do not fall back to AGP's NDK 27 default (4 KiB native LOAD alignment).
+    ndkVersion = "28.0.13004108"
     // [T-android-dynamic-island] Bumped 35→36 so the Android 16 (Baklava)
     // Live Updates APIs — Notification.ProgressStyle, FLAG_PROMOTED_ONGOING,
     // NotificationManager.canPostPromotedNotifications(), setShortCriticalText —

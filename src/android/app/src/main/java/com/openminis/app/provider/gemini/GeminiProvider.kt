@@ -59,9 +59,10 @@ class GeminiProvider(
         thinkingLevel: ThinkingLevel,
     ): LLMResponse = withContext(Dispatchers.IO) {
         val body = buildRequestBody(messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel)
-        val url = "$basePath/models/${model.id}:generateContent?key=$apiKey"
+        val url = "$basePath/models/${model.id}:generateContent"
         val request = Request.Builder()
             .url(url)
+            .header("x-goog-api-key", apiKey)
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             // [T-android-default-ua] Brand the outbound UA so server logs
             // can trace the request back to the Minis build. Gemini has no
@@ -106,9 +107,10 @@ class GeminiProvider(
         thinkingLevel: ThinkingLevel,
     ): Flow<LLMStreamChunk> = callbackFlow {
         val body = buildRequestBody(messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel)
-        val url = "$basePath/models/${model.id}:streamGenerateContent?alt=sse&key=$apiKey"
+        val url = "$basePath/models/${model.id}:streamGenerateContent?alt=sse"
         val request = Request.Builder()
             .url(url)
+            .header("x-goog-api-key", apiKey)
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             // [T-android-default-ua] same intent as the non-streaming
             // branch above — brand outbound requests with Minis/<version>.
@@ -359,6 +361,13 @@ class GeminiProvider(
                 funcDecls.put(tool.toGeminiJson())
             }
             body.put("tools", JSONArray().put(JSONObject().put("function_declarations", funcDecls)))
+            // Raw-audio phone requests must not invent a callable function from a
+            // CLI name mentioned in the prompt. VALIDATED still permits ordinary
+            // text answers; it does not force actions for greetings/questions.
+            if (messages.any { it.audioParts.isNotEmpty() }) {
+                body.put("toolConfig", JSONObject().put("functionCallingConfig",
+                    JSONObject().put("mode", "VALIDATED")))
+            }
         }
 
         val config = JSONObject()

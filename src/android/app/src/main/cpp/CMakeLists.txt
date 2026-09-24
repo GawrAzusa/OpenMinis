@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.22.1)
 project(minis_native CXX C)
 
+# The APK also contains prebuilt dependencies; each ELF needs its own 16 KiB
+# LOAD alignment. ZIP alignment alone cannot fix a 4 KiB-linked JNI library.
+# Keep this explicit so Debug builds and older NDK invocations are safe too.
+add_link_options("-Wl,-z,max-page-size=16384" "-Wl,-z,common-page-size=16384")
+
 add_library(pty_bridge SHARED pty_bridge.c)
 
 # T283: NDK signal handler for native crashes (SIGSEGV/SIGABRT/...).
