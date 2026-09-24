@@ -69,6 +69,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.ensureActive
+import androidx.room.withTransaction
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -1142,7 +1144,14 @@ class ChatViewModel(
     // streaming, hiding the Stop button while the new turn was live).
     @Volatile
     private var streamJob: Job? = null
+    private var assistantSendSetupJob: Job? = null
+    private var assistantResumeSetupJob: Job? = null
+    @Volatile private var assistantTaskPaused = false
     private var currentProvider: LLMProvider? = null
+    private var assistantContextEnabled = false
+
+    /** Only the native assistant workspace opts in; ordinary chat prompts stay unchanged. */
+    internal fun enableAssistantContext() { assistantContextEnabled = true }
     private var currentModel: LLMModel? = null
 
     /**
@@ -5338,14 +5347,9 @@ class ChatViewModel(
      */
     fun retryFromMessage(messageId: String) {
         if (_isStreaming.value) return
-        _canResume.value = false
         val messages = _messages.value
         val index = messages.indexOfFirst { it.id == messageId }
-        if (index < 0) return
-        val message = messages[index]
-        // [T-android-tool-autoscroll] Start-of-turn snap — see resume().
-        _forceScrollToBottom.tryEmit(Unit)
-        if (message.role != "user" || message.content.isBlank()) return
+        if (index < 0 || messages[index].role != "user") return
 
         val initialProvider = currentProvider
         if (initialProvider == null) {
@@ -5354,36 +5358,6 @@ class ChatViewModel(
         }
         val provider: LLMProvider = initialProvider
         _error.value = null
-
-        // T149: snapshot messages about to be truncated so we can revoke any
-        // memory_write tool blocks they contain. Without this, a retry leaves
-        // the on-disk daily log with entries the user has just rewound past.
-        val deletedMessages = messages.subList(index + 1, messages.size).toList()
-
-        // Truncate UI messages: keep up to and including this user message.
-        // T189: if the retried bubble was still in the queued state (manual
-        // retry of a queued message before resumeQueueAfterCancel's grace
-        // window — or fallback when auto-resume is disabled), flip it out of
-        // queued visuals and drop its queue entry so the upcoming send
-        // doesn't double up against a later auto-drain.
-        val retainedHead = messages.subList(0, index + 1).map { m ->
-            if (m.id == messageId && m.isQueued) {
-                m.queuedPromptId?.let { pid ->
-                    _promptQueue.value = _promptQueue.value.filterNot { it.id == pid }
-                }
-                m.copy(isQueued = false, queuedPromptId = null)
-            } else m
-        }
-        _messages.value = retainedHead
-        // T-streaming-side-channel: scrub stream deltas pointing at
-        // messages we just truncated so they can't resurface later.
-        val keptIds = retainedHead.mapTo(mutableSetOf()) { it.id }
-        retainStreamFlushStates(keptIds)
-        if (_streamingById.value.isNotEmpty()) {
-            _streamingById.value = _streamingById.value.filterKeys { it in keptIds }
-        }
-
-        revokeMemoryWritesInDeletedMessages(deletedMessages)
 
         // T145: claim the streaming flag SYNCHRONOUSLY so a rapid second tap
         // (or any concurrent send/retry attempt) is rejected by the entry
@@ -5401,56 +5375,61 @@ class ChatViewModel(
             // unhappy paths; happy path resets in the streamJob's tail.
             var streamLaunched = false
             try {
-            val sid = realSessionId.takeIf { it.isNotEmpty() } ?: sessionId
+                val sid = realSessionId.takeIf { it.isNotEmpty() } ?: sessionId
 
-            // Find the DB sort_order cutoff for this user message.
-            // UI visible user messages are the N-th user msg with actual text content.
-            // Count which visible user message this is (0-based).
-            val visibleUserIndex = messages.subList(0, index + 1).count { it.role == "user" } - 1
-            val dbMessages = chatRepository.loadMessages(sid)
-            // Walk DB rows, counting visible user messages (those with non-toolResult text)
-            var visibleUserCount = 0
-            var cutoffSortOrder = -1
-            for (entity in dbMessages) {
-                if (entity.role == "user") {
-                    // Check if this user message has visible text (not toolResult-only).
-                    // [T-ios-retry-anchor-synthetic-user] Synthetic user rows the
-                    // agent loop persists WITHOUT a UI bubble — resume()'s
-                    // stop-continue "<system-reminder>" message — must not count,
-                    // or the cutoff anchors one user message too early and the
-                    // retried bubble (plus the whole last turn) is silently
-                    // dropped from the rebuilt history (mirrors the iOS fix).
-                    val hasText = try {
-                        val arr = org.json.JSONArray(entity.partsJson)
-                        (0 until arr.length()).any { i ->
-                            val o = arr.getJSONObject(i)
-                            val v = o.optString("value", "")
-                            o.optString("type") == "text" && v.isNotBlank() &&
-                                !v.trimStart().startsWith("<system-reminder>")
-                        }
-                    } catch (_: Exception) { true }
-                    if (hasText) {
-                        if (visibleUserCount == visibleUserIndex) {
-                            cutoffSortOrder = entity.sortOrder + 1
-                            break
-                        }
-                        visibleUserCount++
-                    }
+                val dbMessages = chatRepository.loadMessages(sid)
+                // Resolve the exact original row BEFORE changing DB, UI, queue or memory.
+                // Labels and visible-user ordinals are not persisted request identities.
+                val cutoffSortOrder = com.openminis.app.assistant.AssistantAudioRetryPolicy.retryCutoff(
+                    dbMessages, messageId, context.filesDir,
+                ) ?: run {
+                    _error.value = "The original request is missing or cannot be retried."
+                    return@launch
                 }
-            }
-            if (cutoffSortOrder >= 0) {
                 chatRepository.deleteMessagesAfter(sid, cutoffSortOrder)
-            }
+                _canResume.value = false
+                // [T-android-tool-autoscroll] Snap only after retry validation succeeds.
+                _forceScrollToBottom.tryEmit(Unit)
 
-            // Rebuild agentHistory from remaining DB messages
-            agentHistory.clear()
-            toolLoopDetector.reset()
-            val remaining = chatRepository.loadMessages(sid)
-            for (entity in remaining) {
-                agentHistory.add(entity.toLLMMessage())
-            }
+                // T149: snapshot messages about to be truncated so we can revoke any
+                // memory_write tool blocks they contain. Without this, a retry leaves
+                // the on-disk daily log with entries the user has just rewound past.
+                val deletedMessages = messages.subList(index + 1, messages.size).toList()
 
-            streamLaunched = runRerunStreamTail(provider, "retryFromMessage")
+                // Truncate UI messages: keep up to and including this user message.
+                // T189: if the retried bubble was still in the queued state (manual
+                // retry of a queued message before resumeQueueAfterCancel's grace
+                // window — or fallback when auto-resume is disabled), flip it out of
+                // queued visuals and drop its queue entry so the upcoming send
+                // doesn't double up against a later auto-drain.
+                val retainedHead = messages.subList(0, index + 1).map { m ->
+                    if (m.id == messageId && m.isQueued) {
+                        m.queuedPromptId?.let { pid ->
+                            _promptQueue.value = _promptQueue.value.filterNot { it.id == pid }
+                        }
+                        m.copy(isQueued = false, queuedPromptId = null)
+                    } else m
+                }
+                _messages.value = retainedHead
+                // T-streaming-side-channel: scrub stream deltas pointing at
+                // messages we just truncated so they can't resurface later.
+                val keptIds = retainedHead.mapTo(mutableSetOf()) { it.id }
+                retainStreamFlushStates(keptIds)
+                if (_streamingById.value.isNotEmpty()) {
+                    _streamingById.value = _streamingById.value.filterKeys { it in keptIds }
+                }
+
+                revokeMemoryWritesInDeletedMessages(deletedMessages)
+
+                // Rebuild agentHistory from remaining DB messages
+                agentHistory.clear()
+                toolLoopDetector.reset()
+                val remaining = chatRepository.loadMessages(sid)
+                for (entity in remaining) {
+                    agentHistory.add(entity.toLLMMessage())
+                }
+
+                streamLaunched = runRerunStreamTail(provider, "retryFromMessage")
             } finally {
                 if (!streamLaunched) {
                     AppLogger.info(TAG_STREAM, "retry _isStreaming=false (setup aborted)")
@@ -6189,7 +6168,7 @@ class ChatViewModel(
         fallbackProviders: List<FallbackCandidate>,
         fallbackStrategy: com.openminis.app.data.model.FallbackStrategy,
     ) {
-        while (_promptQueue.value.isNotEmpty()) {
+        while (!assistantTaskPaused && _promptQueue.value.isNotEmpty()) {
             val queued = _promptQueue.value
             _promptQueue.value = emptyList()
             Log.i(TAG, "📨[DRAIN] Draining ${queued.size} queued prompt(s): " +
@@ -6280,6 +6259,82 @@ class ChatViewModel(
         }
     }
 
+    fun assistantImageUnavailableReason(): String? = when {
+        currentProvider == null -> "No model configured."
+        currentProvider?.model?.hasImageInput != true -> "The selected model does not support image input."
+        else -> null
+    }
+
+    /** Pause, retaining queued prompts but preventing automatic queue restarts. */
+    fun pauseAssistantTask() {
+        // Hiding an idle assistant must not mark an already completed answer as
+        // interrupted (or offer to resume/repeat an operation that has finished).
+        val hadActiveStream = _isStreaming.value
+        assistantTaskPaused = true
+        assistantSendSetupJob?.cancel()
+        assistantResumeSetupJob?.cancel()
+        if (hadActiveStream) cancelStream()
+    }
+
+    fun assistantAudioUnavailableReason(): String? =
+        com.openminis.app.assistant.AssistantAudioSupport.unavailableReason(currentProvider)
+
+    /** Borrows the capture file: no share-cache copy may outlive projection revocation. */
+    private var assistantPreviewValid: (() -> Boolean)? = null
+
+    fun addAssistantPreview(file: java.io.File, isCurrent: () -> Boolean = { file.isFile }): Boolean {
+        if (!file.isFile || !file.canRead() || !isCurrent()) return false
+        assistantPreviewValid = isCurrent
+        addAttachment(InputAttachment(fileName = file.name, uri = Uri.fromFile(file),
+            mimeType = "image/png", kind = InputAttachment.Kind.IMAGE))
+        return true
+    }
+
+    private fun assistantContextNeedsAttention(): Boolean {
+        val tokens = _lastTurnContextTokens.value
+        val window = effectiveContextWindowTokens() ?: return false
+        return tokens > 0 && ContextPolicy.forContextWindow(window).check(tokens, window) != ContextPolicy.CheckResult.OK
+    }
+
+    private fun assistantSendUnavailableReason(): String? = when {
+        android.os.Looper.myLooper() != android.os.Looper.getMainLooper() -> "请在主线程发送助手请求。"
+        _isStreaming.value || _isCompacting.value || assistantSendSetupJob?.isActive == true ||
+            assistantResumeSetupJob?.isActive == true -> "请等待当前请求或压缩结束。"
+        _editingMessageId.value != null -> "请先完成当前消息编辑。"
+        currentProvider == null -> "请先在模型设置中选择可用模型。"
+        _attachments.value.isNotEmpty() && assistantImageUnavailableReason() != null -> assistantImageUnavailableReason()
+        assistantContextNeedsAttention() ->
+            "上下文已满。请点击新对话，或打开完整聊天压缩后重试；本次输入已保留，未自动发送。"
+        else -> null
+    }
+
+    /** True means setup started, NOT committed. onAdmission acknowledges DB + history exactly once. */
+    fun sendAssistantText(text: String, onAdmission: (Boolean) -> Unit = {}): Boolean {
+        val reason = assistantSendUnavailableReason()
+        if (reason != null) { _error.value = reason; return false }
+        if (text.isBlank() && _attachments.value.isEmpty()) return false
+        sendMessage(text, skipContextCheck = true,
+            assistantAdmission = com.openminis.app.assistant.AssistantSendAdmission(onAdmission))
+        return true
+    }
+
+    /** False is synchronous refusal; true is setup only, followed by onAdmission. */
+    fun sendAssistantAudio(wavBytes: ByteArray, text: String = "", onAdmission: (Boolean) -> Unit = {}): Boolean {
+        val commonReason = assistantSendUnavailableReason()
+        val reason = when {
+            commonReason != null -> commonReason
+            _attachments.value.any { it.kind != InputAttachment.Kind.IMAGE } -> "原声提问目前仅支持同时附加图片，请先移除其他文件。"
+            _attachments.value.isNotEmpty() && assistantImageUnavailableReason() != null -> assistantImageUnavailableReason()
+            else -> assistantAudioUnavailableReason()
+                ?: com.openminis.app.assistant.AssistantAudioSupport.validateWav(wavBytes)
+        }
+        if (reason != null) { _error.value = reason; return false }
+        val audio = com.openminis.app.assistant.AssistantAudioSupport.part(wavBytes)
+        sendMessage(text, skipContextCheck = true, assistantAudio = audio,
+            assistantAdmission = com.openminis.app.assistant.AssistantSendAdmission(onAdmission))
+        return true
+    }
+
     fun sendMessage(text: String) = sendMessage(text, skipContextCheck = false)
 
     /**
@@ -6289,7 +6344,8 @@ class ChatViewModel(
      *   chunk) token count and pop the dialog again — iOS guards the identical
      *   re-entry with `skipCompactCheck`.
      */
-    private fun sendMessage(text: String, skipContextCheck: Boolean) {
+    private fun sendMessage(text: String, skipContextCheck: Boolean, assistantAudio: LLMMessage.AudioPart? = null,
+        assistantAdmission: com.openminis.app.assistant.AssistantSendAdmission? = null) {
         // [T-android-paste-mediaref] `[Pasted#N]` markers are NOT expanded here
         // any more.
         //
@@ -6315,7 +6371,7 @@ class ChatViewModel(
         // T180: allow attachments-only sends (no caption). Mirrors iOS, where
         // an empty text + non-empty attachments still produces a valid user
         // message. Without this an image-only "look at this" send dropped.
-        if (trimmed.isBlank() && _attachments.value.isEmpty()) return
+        if (trimmed.isBlank() && _attachments.value.isEmpty() && assistantAudio == null) return
         if (_isCompacting.value) {
             appendSystemInfo(
                 text = "Wait for the current compact to finish before sending.",
@@ -6369,6 +6425,8 @@ class ChatViewModel(
         _error.value = null
 
         val currentAttachments = _attachments.value
+        val previewValid = if (assistantAdmission != null && currentAttachments.isNotEmpty()) assistantPreviewValid else null
+        assistantPreviewValid = null
         clearAttachments()
 
         // T145: claim _isStreaming synchronously so a rapid second tap can't
@@ -6399,7 +6457,8 @@ class ChatViewModel(
         val editingId = _editingMessageId.value
         if (editingId != null) _editingMessageId.value = null
 
-        viewModelScope.launch {
+        assistantTaskPaused = false
+        assistantSendSetupJob = viewModelScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
             var streamLaunched = false
             try {
             // Ensure session exists in DB (creates on first message for draft sessions)
@@ -6409,7 +6468,13 @@ class ChatViewModel(
                 truncateBeforeEdit(editingId)
             }
 
+            if (previewValid?.invoke() == false) error("截图已失效，请重新截取。")
             val prepared = prepareUserAttachments(currentAttachments, activeSessionId)
+            if (previewValid?.invoke() == false) error("截图已失效，请重新截取。")
+            if (assistantAdmission != null &&
+                prepared.imageParts.size != currentAttachments.count { it.isImage }) {
+                error("截图已失效或无法读取，请重新截取；本次输入尚未发送。")
+            }
 
             // [T-android-paste-mediaref] Fold `[Pasted#N]` markers out to disk
             // BEFORE persisting, so the stored message carries a mediaRef per
@@ -6430,7 +6495,23 @@ class ChatViewModel(
                 prepared.attachedFilesXml,
                 bodyPartsJson = pasted?.partsJson,
             )
-            val persistedUser = chatRepository.appendMessage(activeSessionId, "user", userPartsJson)
+            val commitUserTurn: suspend () -> Unit = {
+            val savedAudio = com.openminis.app.assistant.AssistantAudioSupport.persist(
+                userPartsJson, assistantAudio, context.filesDir, activeSessionId,
+            )
+            val persistedParts = savedAudio.partsJson
+            val persistedUser = try {
+                if (assistantAdmission != null) {
+                    // appendMessage also updates the session preview after inserting the row.
+                    // Roll both back on failure, so a retry cannot duplicate a partially committed turn.
+                    (context.applicationContext as com.openminis.app.MinisApp).database.withTransaction {
+                        chatRepository.appendMessage(activeSessionId, "user", persistedParts)
+                    }
+                } else chatRepository.appendMessage(activeSessionId, "user", persistedParts)
+            } catch (failure: Throwable) {
+                savedAudio.discard()
+                throw failure
+            }
 
             val userMsg = ChatMessage(
                 id = persistedUser.id,
@@ -6487,10 +6568,15 @@ class ChatViewModel(
             agentHistory.add(LLMMessage(
                 role = LLMMessage.Role.USER,
                 content = modelBody,
+                audioParts = listOfNotNull(assistantAudio),
                 imageParts = imageParts,
                 contentParts = userContentParts,
                 dbMessageId = persistedUser.id,
             ))
+            }
+            if (assistantAdmission != null) assistantAdmission.commit(commitUserTurn)
+            else commitUserTurn()
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
 
             // Refresh OAuth token if needed before sending (mirrors iOS validAccessToken)
             if ((provider as? com.openminis.app.provider.anthropic.AnthropicProvider)?.isOAuth == true) {
@@ -6528,6 +6614,9 @@ class ChatViewModel(
                 else "$prefix\n\n${baseSystemPrompt ?: ""}"
             } else baseSystemPrompt
 
+            // OAuth helpers may swallow cancellation; never launch after assistant pause.
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            if (assistantAdmission != null && assistantTaskPaused) throw CancellationException("Assistant paused")
             // Start agent loop with fallback. _isStreaming was set synchronously at top.
             streamLaunched = true
             streamJob = launch(Dispatchers.IO) {
@@ -6607,13 +6696,23 @@ class ChatViewModel(
                 }
                 AppLogger.info(TAG_STREAM, "send streamJob EXIT")
             }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (assistantAdmission == null) throw e
+                _error.value = e.message ?: if (assistantAdmission.committed)
+                    "输入已保存，但回复准备失败，请继续任务。" else "请求准备失败，输入已保留。"
             } finally {
-                if (!streamLaunched) {
+                assistantAdmission?.reject()
+                if (assistantAdmission?.committed == true && !streamLaunched) _canResume.value = true
+                if (!streamLaunched && assistantSendSetupJob === coroutineContext[Job]) {
                     AppLogger.info(TAG_STREAM, "send _isStreaming=false (setup aborted)")
                     _isStreaming.value = false
                 }
             }
         }
+        assistantSendSetupJob?.invokeOnCompletion { assistantAdmission?.reject() }
+        assistantSendSetupJob?.start()
     }
 
     /** Set error inline on the last assistant message (iOS: message.error).
@@ -7026,7 +7125,7 @@ class ChatViewModel(
             val cleaned = msg.contentParts.filter { part ->
                 part !is AgentContentPart.ToolResult || part.id in allToolUseIds
             }
-            if (cleaned.isEmpty() && msg.content.isBlank()) {
+            if (cleaned.isEmpty() && msg.content.isBlank() && msg.audioParts.isEmpty() && msg.imageParts.isEmpty()) {
                 iter.remove()
             } else if (cleaned.size < msg.contentParts.size) {
                 iter.set(msg.copy(contentParts = cleaned))
@@ -7479,7 +7578,14 @@ class ChatViewModel(
 
         // Fallback state — mirrors iOS streamWithGroupFallback
         var currentProvider = provider
-        val remainingFallbacks = fallbackProviders.toMutableList()
+        // An audio-bearing history must never silently switch models or lose its audio.
+        val hasAssistantAudio = agentHistory.any { it.audioParts.isNotEmpty() }
+        if (hasAssistantAudio) {
+            com.openminis.app.assistant.AssistantAudioSupport.unavailableReason(provider)?.let {
+                throw IllegalStateException(it)
+            }
+        }
+        val remainingFallbacks = (if (hasAssistantAudio) emptyList() else fallbackProviders).toMutableList()
         val fallbackReasons = mutableListOf<String>()
 
         // Accumulate tool inputs across all turns (so persist includes all, not just current turn)
@@ -10077,7 +10183,8 @@ class ChatViewModel(
         // has no personality body, identitySection() returns the identity
         // sentence with its original single trailing space — the full
         // assembled prompt then matches the pre-SOUL prompt byte-for-byte.
-        val identitySection = com.openminis.app.agent.SystemPromptBuilder.identitySection(context)
+        val identitySection = (if (assistantContextEnabled) com.openminis.app.assistant.AssistantTaskGuidance.text else "") +
+            com.openminis.app.agent.SystemPromptBuilder.identitySection(context)
         // [T-memory-toggle-gates-injection-and-tools-android] Mirror the iOS
         // gate: when memory is disabled for this session, replace the
         // "memory_write / memory_get" tool bullets and the "Memory system:"
@@ -11345,7 +11452,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
         // instead of leaving them stuck as dashed bubbles waiting for a manual
         // long-press retry.
         val pending = _promptQueue.value
-        if (pending.isNotEmpty()) {
+        if (!assistantTaskPaused && pending.isNotEmpty()) {
             AppLogger.info(TAG_STREAM, "cancel — ${pending.size} queued prompt(s) remain, restarting drain")
             resumeQueueAfterCancel()
         }
@@ -11366,6 +11473,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
     private fun resumeQueueAfterCancel() {
         viewModelScope.launch {
             kotlinx.coroutines.delay(200)
+            if (assistantTaskPaused) return@launch
             if (_promptQueue.value.isEmpty()) return@launch
             if (_isStreaming.value) return@launch
             // [T-android-compact-queued-drain] Defer while a compact is in
@@ -11654,7 +11762,9 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
      * Clears [_canResume] on entry so repeated taps don't stack.
      */
     fun resume() {
-        if (_isStreaming.value || !_canResume.value) return
+        if (_isStreaming.value || !_canResume.value || assistantSendSetupJob?.isActive == true ||
+            assistantResumeSetupJob?.isActive == true) return
+        assistantTaskPaused = false
         val provider = currentProvider ?: run {
             _error.value = "No provider configured"
             return
@@ -11697,7 +11807,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             }
         }
 
-        viewModelScope.launch {
+        assistantResumeSetupJob = viewModelScope.launch(start = kotlinx.coroutines.CoroutineStart.LAZY) {
+            try {
             val baseSystemPrompt = buildSystemPrompt()
             val systemPrompt =
                 if ((provider as? com.openminis.app.provider.anthropic.AnthropicProvider)?.isOAuth == true) {
@@ -11706,6 +11817,8 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                     else "$prefix\n\n${baseSystemPrompt ?: ""}"
                 } else baseSystemPrompt
 
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            if (assistantTaskPaused) throw CancellationException("Assistant paused")
             AppLogger.info(TAG_STREAM, "resume _isStreaming=true (sid=$activeSessionId)")
             _isStreaming.value = true
             streamJob = launch(Dispatchers.IO) {
@@ -11766,7 +11879,11 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                 }
                 AppLogger.info(TAG_STREAM, "resume streamJob EXIT")
             }
+            } finally {
+                if (assistantTaskPaused) _canResume.value = true
+            }
         }
+        assistantResumeSetupJob?.start()
     }
 
     override fun onCleared() {
@@ -12071,6 +12188,12 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
                     "${entity.partsJson.length} bytes)"
             }
 
+            // A valid captionless recording needs a selectable persisted-ID bubble after reload.
+            // This label is UI-only; toLLMMessage() still restores the exact original audio.
+            text = com.openminis.app.assistant.AssistantAudioRetryPolicy.restoreUserText(
+                entity.role, entity.partsJson, text, context.filesDir,
+            )
+
             // Skip user messages with no visible content (toolResult-only internal messages,
             // or messages that were entirely a system-reminder). A user message that is
             // *only* an image attachment (no caption) still has visible content and must
@@ -12290,6 +12413,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             contentParts = contentParts,
             dbMessageId = id,
             reasoningContent = reasoningContent,
+            audioParts = com.openminis.app.assistant.AssistantAudioSupport.restore(partsJson, context.filesDir),
         )
     }
 

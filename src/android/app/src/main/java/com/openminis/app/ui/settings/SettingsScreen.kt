@@ -110,6 +110,19 @@ fun SettingsScreen(
 ) {
     val context = LocalContext.current
     var showFeedbackSheet by remember { mutableStateOf(false) }
+    var assistantSelected by remember {
+        mutableStateOf(com.openminis.app.assistant.AssistantSettings.isSelected(context))
+    }
+    val lifecycle = androidx.lifecycle.compose.LocalLifecycleOwner.current.lifecycle
+    androidx.compose.runtime.DisposableEffect(lifecycle, context) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                assistantSelected = com.openminis.app.assistant.AssistantSettings.isSelected(context)
+            }
+        }
+        lifecycle.addObserver(observer)
+        onDispose { lifecycle.removeObserver(observer) }
+    }
     Scaffold(
         topBar = {
             TopAppBar(
@@ -161,6 +174,23 @@ fun SettingsScreen(
             }
 
             // -- Appearance --
+            SettingsSection(
+                title = stringResource(R.string.assistant_settings_title),
+                footer = stringResource(R.string.assistant_settings_description),
+            ) {
+                SettingsItem(
+                    icon = Icons.Outlined.Psychology,
+                    iconColor = Color(0xFF5856D6),
+                    title = stringResource(R.string.assistant_settings_title),
+                    subtitle = stringResource(if (assistantSelected)
+                        R.string.assistant_settings_selected else R.string.assistant_settings_choose),
+                    onClick = {
+                        com.openminis.app.assistant.AssistantSettings.open(context)
+                    },
+                    showDivider = false,
+                )
+            }
+
             SettingsSection(title = stringResource(R.string.settings_section_appearance)) {
                 SettingsItem(
                     icon = Icons.Outlined.Palette,

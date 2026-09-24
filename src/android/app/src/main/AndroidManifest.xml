@@ -9,6 +9,8 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- T-android-fgs-timeout-crash: switched from dataSync to mediaPlayback.
          dataSync has a hard 6h/24h cumulative cap on Android 14+, after
          which the system throws ForegroundServiceDidNotStopInTimeException
@@ -192,6 +194,7 @@
             android:resizeableActivity="true"
             android:theme="@style/Theme.Minis"
             android:windowSoftInputMode="adjustResize">
+            <!-- System assistant invocations use MinisVoiceInteractionService's window. -->
             <!-- T-android-dynamic-app-icon: LAUNCHER intent-filter moved
                  to the <activity-alias> entries below so the user can pick
                  an alternate icon. Exactly one alias is enabled at a time
@@ -208,6 +211,37 @@
                 <data android:scheme="minis" />
             </intent-filter>
         </activity>
+
+        <service android:name=".assistant.MinisVoiceInteractionService" android:label="@string/app_name"
+            android:exported="true" android:permission="android.permission.BIND_VOICE_INTERACTION">
+            <intent-filter><action android:name="android.service.voice.VoiceInteractionService" /></intent-filter>
+            <meta-data android:name="android.voice_interaction" android:resource="@xml/assistant_voice_service" />
+        </service>
+        <service android:name=".assistant.MinisVoiceSessionService"
+            android:exported="true" android:permission="android.permission.BIND_VOICE_INTERACTION" />
+        <service android:name=".assistant.AssistantRecognitionService"
+            android:exported="true" android:permission="android.permission.BIND_SPEECH_RECOGNITION_SERVICE">
+            <intent-filter><action android:name="android.speech.RecognitionService" /></intent-filter>
+        </service>
+        <activity android:name=".assistant.AssistantPermissionActivity" android:exported="false"
+            android:excludeFromRecents="true" android:taskAffinity="" android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <activity android:name=".assistant.AssistantEntryActivity" android:exported="true"
+            android:excludeFromRecents="true" android:taskAffinity="" android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.ASSIST" />
+                <action android:name="android.intent.action.VOICE_ASSIST" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+        <service android:name=".assistant.AssistantBubbleService" android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-requested minimized digital assistant bubble; paused task recovery and dismiss controls" />
+        </service>
+        <activity android:name=".assistant.screen.AssistantScreenCaptureConsentActivity" android:exported="false"
+            android:excludeFromRecents="true" android:taskAffinity="" android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+        <service android:name=".assistant.screen.AssistantScreenCaptureService" android:exported="false"
+            android:foregroundServiceType="mediaProjection" />
 
         <!-- T-android-dynamic-app-icon: launcher-icon aliases. Exactly
              ONE of these three is enabled at any time; AppIconRepository

@@ -446,12 +446,11 @@ class XunfeiVoiceProvider(
     }
 }
 
-// -- Google Gemini (native TTS via generateContent + AUDIO modality) ----------
+// -- Google Gemini (independent native ASR and TTS via generateContent) -------
 
 /**
- * Gemini TTS is NOT OpenAI-compatible: POST {base}/v1beta/models/{model}:
- * generateContent with the key in ?key= and base64 raw PCM (24 kHz mono) in
- * candidates[0].content.parts[].inlineData.data. Wrap the PCM in WAV.
+ * Native Google API, with no agent history or tools. ASR uses the separately
+ * selected input model; TTS accepts either legacy PCM or the newer unary WAV.
  */
 class GeminiVoiceProvider(providerId: String, baseURL: String, apiKey: String?) :
     VoiceProvider(providerId, baseURL, apiKey) {
@@ -463,26 +462,55 @@ class GeminiVoiceProvider(providerId: String, baseURL: String, apiKey: String?) 
             return if (v in KNOWN_VOICES) v else "Kore"
         }
 
-        private fun sampleRate(fromMime: String): Int {
-            val idx = fromMime.indexOf("rate=")
-            if (idx < 0) return 24000
-            return fromMime.substring(idx + 5).takeWhile { it.isDigit() }.toIntOrNull() ?: 24000
-        }
     }
 
-    override val supportsVoiceInput: Boolean get() = false
+    override fun defaultVoiceInputModel() = "gemini-3.5-transcribe"
     override fun defaultVoiceOutputModel() = "gemini-2.5-flash-preview-tts"
+
+    private fun inputModel(request: VoiceInputRequest): String =
+        request.model?.takeIf { it.isNotBlank() } ?: request.resolvedModel?.id ?: defaultVoiceInputModel()
+
+    private fun generateContentUrl(model: String): String {
+        val base = effectiveBaseURL().trimEnd('/')
+        val versioned = if (base.endsWith("/v1beta") || base.endsWith("/v1")) base else "$base/v1beta"
+        return "$versioned/models/$model:generateContent"
+    }
+
+    override fun buildVoiceInputRequest(request: VoiceInputRequest): Request {
+        val model = inputModel(request)
+        val body = GeminiVoiceCodec.transcriptionBody(request.audioData, request.language, request.prompt,
+            GeminiVoiceCodec.isDedicatedTranscription(model))
+        return Request.Builder().url(generateContentUrl(model))
+            .header("x-goog-api-key", apiKey ?: "")
+            .post(body.toString().toRequestBody("application/json".toMediaType())).build()
+    }
+
+    override suspend fun transcribe(request: VoiceInputRequest): VoiceInputResponse {
+        // Bypass the generic OpenAI chat-ASR heuristic even for custom audio model IDs.
+        // executeRequest binds coroutine cancellation to OkHttp Call.cancel (including body reads).
+        kotlinx.coroutines.currentCoroutineContext().ensureActiveForGeminiVoice()
+        if (request.audioData.isEmpty()) return VoiceInputResponse("", language = request.language)
+        return parseVoiceInputResponse(executeRequest(buildVoiceInputRequest(request)), request)
+    }
+
+    override fun parseVoiceInputResponse(data: ByteArray, request: VoiceInputRequest): VoiceInputResponse =
+        try {
+            VoiceInputResponse(GeminiVoiceCodec.transcription(data,
+                GeminiVoiceCodec.isDedicatedTranscription(inputModel(request))), language = request.language)
+        } catch (failure: IllegalArgumentException) {
+            throw VoiceProviderException.Parse(failure.message ?: "Invalid Gemini ASR response")
+        } catch (failure: org.json.JSONException) {
+            throw VoiceProviderException.Parse("Invalid Gemini ASR JSON response")
+        }
 
     override fun buildVoiceOutputRequest(request: VoiceOutputRequest): Request {
         val model = request.model ?: defaultVoiceOutputModel()
-        var base = effectiveBaseURL()
-        if (!base.contains("/v1beta")) base = base.trimEnd('/') + "/v1beta"
-        val url = "$base/models/$model:generateContent?key=${apiKey ?: ""}"
+        val url = generateContentUrl(model)
         val body = JSONObject()
             .put(
                 "contents",
                 JSONArray().put(
-                    JSONObject().put("parts", JSONArray().put(JSONObject().put("text", request.input))),
+                    JSONObject().put("parts", JSONArray().put(GeminiVoiceCodec.speechPart(request.input, model, request.speed))),
                 ),
             )
             .put(
@@ -502,28 +530,21 @@ class GeminiVoiceProvider(providerId: String, baseURL: String, apiKey: String?) 
             )
         return Request.Builder()
             .url(url)
+            .header("x-goog-api-key", apiKey ?: "")
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
     }
 
     override suspend fun synthesize(request: VoiceOutputRequest): ByteArray {
         val raw = executeRequest(buildVoiceOutputRequest(request))
-        val json = runCatching { JSONObject(String(raw, Charsets.UTF_8)) }.getOrNull()
-            ?: throw VoiceProviderException.Parse("Unexpected Gemini TTS response")
-        val parts = json.optJSONArray("candidates")
-            ?.optJSONObject(0)
-            ?.optJSONObject("content")
-            ?.optJSONArray("parts")
-            ?: throw VoiceProviderException.Parse("Unexpected Gemini TTS response")
-        for (i in 0 until parts.length()) {
-            val inline = parts.optJSONObject(i)?.optJSONObject("inlineData") ?: continue
-            val b64 = inline.optString("data").takeIf { it.isNotEmpty() } ?: continue
-            val pcm = runCatching { Base64.decode(b64, Base64.DEFAULT) }.getOrNull() ?: continue
-            val mime = inline.optString("mimeType").ifBlank { "audio/L16;rate=24000" }
-            if (mime.lowercase().contains("wav")) return pcm
-            return wrapPcm16InWav(pcm, sampleRate(mime))
+        val audio = try {
+            GeminiVoiceCodec.audio(raw)
+        } catch (failure: IllegalArgumentException) {
+            throw VoiceProviderException.Parse(failure.message ?: "Invalid Gemini TTS response")
+        } catch (failure: org.json.JSONException) {
+            throw VoiceProviderException.Parse("Invalid Gemini TTS JSON response")
         }
-        throw VoiceProviderException.Parse("No audio in Gemini TTS response")
+        return audio.pcmSampleRate?.let { wrapPcm16InWav(audio.bytes, it) } ?: audio.bytes
     }
 }
 

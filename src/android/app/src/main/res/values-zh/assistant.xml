@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="assistant_settings_title">默认数字助理</string>
+    <string name="assistant_settings_selected">Minis 已是默认数字助理</string>
+    <string name="assistant_settings_choose">在 Android 设置中选择 Minis</string>
+    <string name="assistant_settings_description">通过系统助理按钮或手势唤起小窗，可打字、录音、截图和共享屏幕。原声录音需使用支持音频及工具调用的模型，确认发送后才交给模型。收成小球会暂停任务。升级后若仍打开整页，请在系统设置先选择“无”，再选 Minis。操作其他应用需单独授权，具体唤起手势由系统决定。</string>
+    <string name="assistant_settings_unavailable">请打开系统设置 → 应用 → 默认应用 → 数字助理应用，选择 Minis。</string>
+    <string name="assistant_unlock_first">请解锁手机后再次呼出 Minis。</string>
+</resources>

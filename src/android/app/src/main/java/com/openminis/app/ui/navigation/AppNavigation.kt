@@ -292,6 +292,7 @@ fun AppNavigation(
             // (done up-front in startDestination block below so the seed
             // lands before ChatScreen's first compose).
             is DeepLinkAction.NewChat,
+            is DeepLinkAction.NewAssistantChat,
             is DeepLinkAction.NewVoiceChat,
             is DeepLinkAction.NewCameraChat -> {
                 // Navigation handled by startDestination = chat/<__new__…>
@@ -457,7 +458,9 @@ fun AppNavigation(
     // draft chat, seeding the pending action so ChatScreen consumes it on
     // its first LaunchedEffect tick. Mirrors the htmlShortcut path —
     // avoids a sessions-list flash and a duplicate back-stack entry.
-    val quickActionStart: String? = when (initialDeepLink) {
+    val quickActionStart: String? = remember(initialDeepLink) { when (initialDeepLink) {
+        is DeepLinkAction.NewAssistantChat ->
+            Routes.chat(com.openminis.app.assistant.AssistantLaunch.newSessionId())
         is DeepLinkAction.NewVoiceChat -> {
             DeepLinkCoordinator.setPendingChatAction(
                 DeepLinkCoordinator.ChatAction.START_VOICE,
@@ -472,7 +475,7 @@ fun AppNavigation(
         }
         is DeepLinkAction.NewChat -> Routes.chat("__new__${java.util.UUID.randomUUID()}")
         else -> null
-    }
+    } }
     val startDestination = when {
         htmlShortcut != null -> {
             // Seed coordinator before NavHost composition so ChatScreen sees

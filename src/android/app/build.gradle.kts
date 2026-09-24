@@ -24,6 +24,8 @@ fun customizationValue(key: String): String =
 
 android {
     namespace = "com.openminis.app"
+    // Do not fall back to AGP's NDK 27 default (4 KiB native LOAD alignment).
+    ndkVersion = "28.0.13004108"
     // [T-android-dynamic-island] Bumped 35→36 so the Android 16 (Baklava)
     // Live Updates APIs — Notification.ProgressStyle, FLAG_PROMOTED_ONGOING,
     // NotificationManager.canPostPromotedNotifications(), setShortCriticalText —
@@ -108,6 +110,13 @@ android {
     sourceSets {
         getByName("androidTest") {
             assets.srcDirs("$projectDir/schemas")
+            // Opt-in feature-only harness. The public baseline's unrelated
+            // ExecutionCoordinator tests reference a removed mountedSessionId
+            // API and do not compile. Keep the default full suite unchanged;
+            // never report this scoped run as a full-suite pass.
+            if (providers.gradleProperty("assistantOnlyInstrumentation").orNull == "true") {
+                java.setSrcDirs(listOf("src/androidTest/java/com/openminis/app/assistant"))
+            }
         }
     }
 

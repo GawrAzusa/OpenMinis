@@ -59,9 +59,10 @@ class GeminiProvider(
         thinkingLevel: ThinkingLevel,
     ): LLMResponse = withContext(Dispatchers.IO) {
         val body = buildRequestBody(messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel)
-        val url = "$basePath/models/${model.id}:generateContent?key=$apiKey"
+        val url = "$basePath/models/${model.id}:generateContent"
         val request = Request.Builder()
             .url(url)
+            .header("x-goog-api-key", apiKey)
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             // [T-android-default-ua] Brand the outbound UA so server logs
             // can trace the request back to the Minis build. Gemini has no
@@ -106,9 +107,10 @@ class GeminiProvider(
         thinkingLevel: ThinkingLevel,
     ): Flow<LLMStreamChunk> = callbackFlow {
         val body = buildRequestBody(messages, systemPrompt, maxTokens, temperature, imageParts, tools, thinkingLevel)
-        val url = "$basePath/models/${model.id}:streamGenerateContent?alt=sse&key=$apiKey"
+        val url = "$basePath/models/${model.id}:streamGenerateContent?alt=sse"
         val request = Request.Builder()
             .url(url)
+            .header("x-goog-api-key", apiKey)
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             // [T-android-default-ua] same intent as the non-streaming
             // branch above — brand outbound requests with Minis/<version>.
@@ -310,8 +312,22 @@ class GeminiProvider(
                         parts.put(JSONObject().put("inlineData", inlineData))
                     }
                 }
-                val legacyText = msg.content.ifEmpty { " " }
-                parts.put(JSONObject().put("text", legacyText))
+                if (msg.content.isNotEmpty() || msg.audioParts.isEmpty()) {
+                    val legacyText = msg.content.ifEmpty { " " }
+                    parts.put(JSONObject().put("text", legacyText))
+                }
+            }
+            // generateContent (including SSE), not Live: audio is an inline binary
+            // part alongside text/images. Replay each turn, not just the last user
+            // turn, so tool followups and restored history retain the original WAV.
+            // https://ai.google.dev/gemini-api/docs/audio
+            for (audio in msg.audioParts) {
+                require(msg.role == LLMMessage.Role.USER) { "Gemini audio input requires a user turn." }
+                require(audio.format == "wav") { "Gemini assistant audio input requires WAV." }
+                parts.put(JSONObject().put("inlineData", JSONObject().apply {
+                    put("mimeType", "audio/wav")
+                    put("data", audio.base64Data)
+                }))
             }
             // [T-gemini-empty-part-oneof-400] Parity with iOS convertMessages: a
             // turn whose only content was an empty .Text (skipped above) would
@@ -345,6 +361,13 @@ class GeminiProvider(
                 funcDecls.put(tool.toGeminiJson())
             }
             body.put("tools", JSONArray().put(JSONObject().put("function_declarations", funcDecls)))
+            // Raw-audio phone requests must not invent a callable function from a
+            // CLI name mentioned in the prompt. VALIDATED still permits ordinary
+            // text answers; it does not force actions for greetings/questions.
+            if (messages.any { it.audioParts.isNotEmpty() }) {
+                body.put("toolConfig", JSONObject().put("functionCallingConfig",
+                    JSONObject().put("mode", "VALIDATED")))
+            }
         }
 
         val config = JSONObject()
