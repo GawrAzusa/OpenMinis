@@ -5381,7 +5381,7 @@ class ChatViewModel(
                 // Resolve the exact original row BEFORE changing DB, UI, queue or memory.
                 // Labels and visible-user ordinals are not persisted request identities.
                 val cutoffSortOrder = com.openminis.app.assistant.AssistantAudioRetryPolicy.retryCutoff(
-                    dbMessages, messageId,
+                    dbMessages, messageId, context.filesDir,
                 ) ?: run {
                     _error.value = "The original request is missing or cannot be retried."
                     return@launch
@@ -6496,14 +6496,22 @@ class ChatViewModel(
                 bodyPartsJson = pasted?.partsJson,
             )
             val commitUserTurn: suspend () -> Unit = {
-            val persistedParts = com.openminis.app.assistant.AssistantAudioSupport.persist(userPartsJson, assistantAudio)
-            val persistedUser = if (assistantAdmission != null) {
-                // appendMessage also updates the session preview after inserting the row.
-                // Roll both back on failure, so a retry cannot duplicate a partially committed turn.
-                (context.applicationContext as com.openminis.app.MinisApp).database.withTransaction {
-                    chatRepository.appendMessage(activeSessionId, "user", persistedParts)
-                }
-            } else chatRepository.appendMessage(activeSessionId, "user", persistedParts)
+            val savedAudio = com.openminis.app.assistant.AssistantAudioSupport.persist(
+                userPartsJson, assistantAudio, context.filesDir, activeSessionId,
+            )
+            val persistedParts = savedAudio.partsJson
+            val persistedUser = try {
+                if (assistantAdmission != null) {
+                    // appendMessage also updates the session preview after inserting the row.
+                    // Roll both back on failure, so a retry cannot duplicate a partially committed turn.
+                    (context.applicationContext as com.openminis.app.MinisApp).database.withTransaction {
+                        chatRepository.appendMessage(activeSessionId, "user", persistedParts)
+                    }
+                } else chatRepository.appendMessage(activeSessionId, "user", persistedParts)
+            } catch (failure: Throwable) {
+                savedAudio.discard()
+                throw failure
+            }
 
             val userMsg = ChatMessage(
                 id = persistedUser.id,
@@ -12183,7 +12191,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             // A valid captionless recording needs a selectable persisted-ID bubble after reload.
             // This label is UI-only; toLLMMessage() still restores the exact original audio.
             text = com.openminis.app.assistant.AssistantAudioRetryPolicy.restoreUserText(
-                entity.role, entity.partsJson, text,
+                entity.role, entity.partsJson, text, context.filesDir,
             )
 
             // Skip user messages with no visible content (toolResult-only internal messages,
@@ -12405,7 +12413,7 @@ Scheduled tasks: crontab / at / nohup loops will stop when the app is suspended,
             contentParts = contentParts,
             dbMessageId = id,
             reasoningContent = reasoningContent,
-            audioParts = com.openminis.app.assistant.AssistantAudioSupport.restore(partsJson),
+            audioParts = com.openminis.app.assistant.AssistantAudioSupport.restore(partsJson, context.filesDir),
         )
     }
 

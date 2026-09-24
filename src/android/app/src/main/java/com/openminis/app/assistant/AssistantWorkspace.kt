@@ -40,6 +40,9 @@ object AssistantWorkspace {
     internal val toolOwnership = AssistantOperationOwnership()
     private var mainDraftShared = false
     private var captureEpoch = 0
+    internal fun voiceRequest() = AssistantVoiceRequest(sessionKey, captureEpoch)
+    internal fun currentVoiceRequest(request: AssistantVoiceRequest) =
+        request.isCurrent(sessionKey, captureEpoch, visible, toolOwnership.handedOff)
     // Retained until the VM acknowledges DB + history, not its synchronous busy claim.
     private var pendingTurn: State? = null
     private var discardPendingMedia = false
@@ -119,12 +122,18 @@ object AssistantWorkspace {
         if (enabled) VoiceOutputState.setMuted(false) else speaker?.stop()
         mutable.update { it.copy(speech = enabled) }
     }
-    fun beginRecording(context: Context) {
-        if (!initialize(context) || mutable.value.busy || pendingTurn != null) return
+    suspend fun awaitModelReady() {
+        withTimeoutOrNull(3000) { vm?.modelName?.first { it.isNotBlank() } }
+        yield() // Provider construction follows the model-name update on the main dispatcher.
+    }
+    fun audioUnavailableReason(): String? = vm?.assistantAudioUnavailableReason() ?: if (vm == null) "模型尚未就绪" else null
+
+    fun beginRecording(context: Context, onReady: () -> Unit = {}) {
+        if (!initialize(context) || !visible || mutable.value.busy || pendingTurn != null || mutable.value.recording) return
         val reason = vm?.assistantAudioUnavailableReason()
         if (reason != null) { error(reason); return }
         if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            AssistantPermissionActivity.open(context, "microphone")
+            error("麦克风未授权，可以继续打字。")
             return
         }
         cancelRecording()
@@ -136,14 +145,23 @@ object AssistantWorkspace {
             onError = { problem -> scope.launch { if (epoch == captureEpoch) {
                 cancelRecording(); error(problem)
             } } },
+            onEndpoint = { hasSpeech ->
+                if (epoch == captureEpoch && visible) {
+                    if (hasSpeech) endRecording(onReady)
+                    else { cancelRecording(); error("没有听到说话，已停止聆听。可点击语音重试或直接打字。") }
+                }
+            },
         ) == true
-        mutable.update { it.copy(recording = started, audio = null) }
+        mutable.update { it.copy(recording = started, audio = null, paused = false) }
         if (started) scope.launch {
-            delay(AssistantAudioSupport.MAX_SECONDS * 1000L)
-            if (captureEpoch == epoch && mutable.value.recording) endRecording()
+            // Audio samples own the 60-second endpoint. This is only a stalled-read failsafe.
+            delay((AssistantAudioSupport.MAX_SECONDS + 2) * 1000L)
+            if (captureEpoch == epoch && mutable.value.recording) {
+                cancelRecording(); error("录音已超时，请重试。")
+            }
         }
     }
-    fun endRecording() {
+    fun endRecording(onReady: () -> Unit = {}) {
         if (!mutable.value.recording) return
         val epoch = captureEpoch
         mutable.update { it.copy(recording = false, level = 0f) }
@@ -151,6 +169,7 @@ object AssistantWorkspace {
             val wav = recorder?.stop()
             if (captureEpoch == epoch && visible) {
                 mutable.update { it.copy(audio = wav, error = if (wav == null) "没有录到有效音频，请重试。" else null) }
+                if (wav != null) onReady()
             }
         }
     }

@@ -34,6 +34,7 @@ class MinisVoiceInteractionService : VoiceInteractionService() {
     override fun onLaunchVoiceAssistFromKeyguard() { /* Unlock through Android first. */ }
     companion object {
         internal const val RETURN_TICKET = "assistant_return_ticket"
+        internal const val VOICE_INVOCATION = "assistant_voice_invocation"
         private var active: MinisVoiceInteractionService? = null
         fun open(context: Context, resume: Boolean = true, ticket: Long? = null): Boolean {
             if (ticket != null && !AssistantReturnGate.current(ticket)) return false
@@ -41,6 +42,7 @@ class MinisVoiceInteractionService : VoiceInteractionService() {
             if (!isActiveService(context, ComponentName(context, MinisVoiceInteractionService::class.java))) return false
             return runCatching { active?.showSession(Bundle().apply {
                 putBoolean("resume", resume)
+                putBoolean(VOICE_INVOCATION, !resume)
                 if (ticket != null) putLong(RETURN_TICKET, ticket)
             }, 0) != null }.getOrDefault(false)
         }

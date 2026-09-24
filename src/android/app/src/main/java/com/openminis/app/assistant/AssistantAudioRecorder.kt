@@ -38,7 +38,8 @@ class AssistantAudioRecorder(context: Context) {
     }
 
     @Synchronized
-    fun start(onLevel: (Float) -> Unit, onError: (String) -> Unit): Boolean {
+    fun start(onLevel: (Float) -> Unit, onError: (String) -> Unit,
+        onEndpoint: ((Boolean) -> Unit)? = null): Boolean {
         if (session != null) { onError("A recording is already active."); return false }
         if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             onError("Microphone permission is required."); return false
@@ -60,6 +61,7 @@ class AssistantAudioRecorder(context: Context) {
             Thread({
                 try {
                     val buffer = ByteArray(2048)
+                    val endpoint = AssistantVoiceEndpoint()
                     while (capture.running.get() && capture.pcm.size() < AssistantAudioSupport.MAX_PCM_BYTES) {
                         val count = native.read(buffer, 0, minOf(buffer.size,
                             AssistantAudioSupport.MAX_PCM_BYTES - capture.pcm.size()))
@@ -73,8 +75,20 @@ class AssistantAudioRecorder(context: Context) {
                         }
                         val level = sqrt(power / (count / 2)).toFloat().coerceIn(0f, 1f)
                         main.post { if (isCurrent(capture) && capture.running.get()) onLevel(level) }
+                        if (onEndpoint != null) {
+                            val decision = endpoint.accept(level,
+                                count.toLong() * 1000 / (AssistantAudioSupport.SAMPLE_RATE * 2))
+                            if (decision != AssistantVoiceEndpoint.Decision.CONTINUE ||
+                                capture.pcm.size() >= AssistantAudioSupport.MAX_PCM_BYTES) {
+                                val hasSpeech = endpoint.hasSpeech
+                                main.post {
+                                    if (isCurrent(capture) && !capture.cancelled.get()) onEndpoint(hasSpeech)
+                                }
+                                break
+                            }
+                        }
                     }
-                    // Bound capture even when the user never taps stop. Keep bytes for explicit stop/send.
+                    // Keep the original PCM, including pauses; the local detector never transcribes it.
                 } catch (e: Exception) {
                     if (capture.running.get()) {
                         capture.failed = true

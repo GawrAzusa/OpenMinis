@@ -1,8 +1,10 @@
 package com.openminis.app.assistant
 
+import android.Manifest
 import android.app.KeyguardManager
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
@@ -51,6 +53,8 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
     private var generation = 0
     private var previousPreview: String? = null
     private var previousTranscript = ""
+    private val voiceEntry = AssistantVoiceEntry()
+    private var voiceStart: Job? = null
     private val ink = Color.rgb(238, 241, 255)
     private val muted = Color.rgb(157, 169, 199)
     private val blue = Color.rgb(159, 195, 255)
@@ -85,6 +89,8 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
     override fun onCreateContentView(): View {
         root = FrameLayout(context).apply {
             background = AssistantWindowBackground()
+            isFocusableInTouchMode = true
+            descendantFocusability = android.view.ViewGroup.FOCUS_BEFORE_DESCENDANTS
             setOnClickListener { minimize() }
         }
         // Android 15 enforces edge-to-edge even for voice sessions: adjustResize alone
@@ -187,6 +193,11 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
             setPadding(dp(10), dp(12), dp(6), dp(12)); contentDescription = "助理文字输入"
             inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_FLAG_MULTI_LINE
             imeOptions = android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI or android.view.inputmethod.EditorInfo.IME_FLAG_NO_FULLSCREEN
+            setOnFocusChangeListener { _, focused -> if (focused) switchToTyping() }
+            setOnTouchListener { _, event ->
+                if (event.actionMasked == android.view.MotionEvent.ACTION_DOWN) switchToTyping()
+                false
+            }
             addTextChangedListener(object : TextWatcher {
                 override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) = Unit
                 override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) { AssistantWorkspace.setDraft(s?.toString().orEmpty()) }
@@ -200,13 +211,13 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
         composer.addView(send, LinearLayout.LayoutParams(dp(42), dp(42)))
         card.addView(composer)
         val tools = row().apply { setPadding(0, dp(11), 0, 0) }
-        tools.addWeighted(action("⌨ 打字") { input.requestFocus(); (context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(input, InputMethodManager.SHOW_IMPLICIT) })
+        tools.addWeighted(action("⌨ 打字") {
+            switchToTyping()
+            input.requestFocus(); (context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager).showSoftInput(input, InputMethodManager.SHOW_IMPLICIT)
+        })
         mic = action("◉ 语音") {
-            if (AssistantWorkspace.state.value.recording) AssistantWorkspace.endRecording()
-            else {
-                AssistantWorkspace.beginRecording(context)
-                if (AssistantReturnGate.hasExpectedHide()) hide()
-            }
+            if (AssistantWorkspace.state.value.recording) AssistantWorkspace.endRecording { sendTurn() }
+            else startListening(onlyEmptyComposer = false)
         }; tools.addWeighted(mic)
         tools.addWeighted(action("▣ 截图") { capture(false) })
         share = action("▤ 共享") { if (shareActive) AssistantScreenCapture.stop(context) else capture(true) }
@@ -215,7 +226,7 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
         val footer = row().apply { setPadding(0, dp(10), 0, 0) }
         speech = label("声音：关闭", 11f, muted).apply { minHeight = dp(36); gravity = Gravity.CENTER_VERTICAL; setOnClickListener { AssistantWorkspace.toggleSpeech() } }
         footer.addWeighted(speech)
-        footer.addView(action("新对话") { awaitingCapture = false; AssistantReturnGate.invalidate(); AssistantWorkspace.newConversation(context) })
+        footer.addView(action("新对话") { switchToTyping(); awaitingCapture = false; AssistantReturnGate.invalidate(); AssistantWorkspace.newConversation(context) })
         stop = action("停止任务") { if (AssistantWorkspace.state.value.canResume && !AssistantWorkspace.state.value.busy) AssistantWorkspace.resume() else AssistantWorkspace.pause() }
         footer.addView(stop, LinearLayout.LayoutParams(-2, dp(40)).apply { marginStart = dp(6) })
         footer.addView(action("设置") { openSettings() }, LinearLayout.LayoutParams(-2, dp(40)).apply { marginStart = dp(6) })
@@ -292,7 +303,7 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
         refreshRepairGuidance()
         modelLabel.text = state.model
         status.text = when {
-            state.recording -> "正在听，点击结束录音…"
+            state.recording -> "正在听，请说话…说完会自动发送"
             state.busy -> "正在为你处理…"
             state.paused -> "已暂停，手机交还给你"
             state.audio != null -> "原声已准备好，点击发送"
@@ -382,6 +393,36 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
         context.startActivity(Intent(Intent.ACTION_VIEW, AssistantWorkspace.conversationUri(), context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
     private fun closeAll() { generation++; AssistantReturnGate.invalidate(); awaitingCapture = false; AssistantWorkspace.close(context); hide() }
+    private fun switchToTyping() {
+        voiceStart?.cancel(); voiceStart = null
+        voiceEntry.cancel()
+        AssistantWorkspace.cancelRecording()
+    }
+    private fun startListening(onlyEmptyComposer: Boolean = true) {
+        voiceStart?.cancel()
+        voiceEntry.cancel()
+        val request = AssistantWorkspace.voiceRequest()
+        voiceStart = scope.launch {
+            // Let the system window become visible before acquiring the microphone.
+            yield()
+            AssistantWorkspace.awaitModelReady()
+            val state = AssistantWorkspace.state.value
+            if (!AssistantWorkspace.currentVoiceRequest(request) || !shown || toolSurfaceLocked() || state.busy || state.recording || state.audio != null ||
+                (onlyEmptyComposer && state.draft.isNotBlank())) return@launch
+            AssistantWorkspace.audioUnavailableReason()?.let { AssistantWorkspace.error(it); return@launch }
+            if (::root.isInitialized) {
+                root.requestFocus()
+                (context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+                    .hideSoftInputFromWindow(input.windowToken, 0)
+            }
+            if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                voiceEntry.awaitingMicrophone(AssistantPermissionActivity.open(context, "microphone"), onlyEmptyComposer)
+                hide()
+                return@launch
+            }
+            AssistantWorkspace.beginRecording(context) { if (shown && !toolSurfaceLocked()) sendTurn() }
+        }
+    }
     override fun onShow(args: Bundle?, showFlags: Int) {
         super.onShow(args, showFlags)
         if (args?.containsKey(MinisVoiceInteractionService.RETURN_TICKET) == true &&
@@ -412,11 +453,22 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
         refreshApproval()
         refreshRepairGuidance()
         if (restoringTool) AssistantToolSurface.onRestored(this)
+
+        voiceStart?.cancel(); voiceStart = null
+        val explicitInvocation = (showFlags and (SHOW_SOURCE_ASSIST_GESTURE or SHOW_SOURCE_PUSH_TO_TALK) != 0) ||
+            args?.getBoolean(MinisVoiceInteractionService.VOICE_INVOCATION, false) == true
+        val returnTicket = args?.takeIf { it.containsKey(MinisVoiceInteractionService.RETURN_TICKET) }
+            ?.getLong(MinisVoiceInteractionService.RETURN_TICKET)
+        val microphoneGranted = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+        if (voiceEntry.shouldListen(explicitInvocation, restoringTool || args?.getBoolean("resume", false) == true,
+                returnTicket, microphoneGranted)) startListening(voiceEntry.onlyEmptyComposer)
     }
     override fun onHide() {
+        voiceStart?.cancel(); voiceStart = null
         shown = false
         val expected = AssistantReturnGate.consumeExpectedHide()
         if (!expected) {
+            voiceEntry.cancel()
             AssistantReturnGate.invalidate(); awaitingCapture = false
         }
         // Only an acknowledged, current tool-owned hide may keep the task alive.
@@ -431,9 +483,10 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
     }
     override fun onBackPressed() { minimize() }
     override fun onCloseSystemDialogs() {
+        switchToTyping()
         AssistantReturnGate.invalidate(); awaitingCapture = false
         AssistantWorkspace.pause(); hide()
     }
     override fun onLockscreenShown() { closeAll(); super.onLockscreenShown() }
-    override fun onDestroy() { generation++; AssistantReturnGate.invalidate(); awaitingCapture = false; AssistantToolSurface.detach(this); scope.cancel(); AssistantWorkspace.pause(); AssistantWorkspace.setVisible(false); super.onDestroy() }
+    override fun onDestroy() { voiceEntry.cancel(); generation++; AssistantReturnGate.invalidate(); awaitingCapture = false; AssistantToolSurface.detach(this); scope.cancel(); AssistantWorkspace.pause(); AssistantWorkspace.setVisible(false); super.onDestroy() }
 }

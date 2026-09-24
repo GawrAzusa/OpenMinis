@@ -9,7 +9,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
 
-/** Permission-only trampoline. Returning grants UI access, never auto-starts a recorder or task. */
+/** Permission-only trampoline. The live session alone owns a one-shot microphone continuation. */
 class AssistantPermissionActivity : Activity() {
     private var launched = false
     private var purpose = ""
@@ -55,7 +55,7 @@ class AssistantPermissionActivity : Activity() {
             complete()
         }
         if (requestCode == 41) {
-            AssistantWorkspace.error(if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) "麦克风已授权，点击语音开始录音。" else "麦克风未授权，可以继续打字。")
+            AssistantWorkspace.error(if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) null else "麦克风未授权，可以继续打字。")
             complete()
         }
     }
@@ -69,9 +69,11 @@ class AssistantPermissionActivity : Activity() {
         }, 180)
     }
     companion object {
-        fun open(context: Context, purpose: String) {
+        fun open(context: Context, purpose: String): Long {
+            val ticket = AssistantReturnGate.beginTemporary()
             context.startActivity(Intent(context, AssistantPermissionActivity::class.java)
-                .putExtra("purpose", purpose).putExtra("ticket", AssistantReturnGate.beginTemporary()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK))
+                .putExtra("purpose", purpose).putExtra("ticket", ticket).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_MULTIPLE_TASK))
+            return ticket
         }
     }
 }

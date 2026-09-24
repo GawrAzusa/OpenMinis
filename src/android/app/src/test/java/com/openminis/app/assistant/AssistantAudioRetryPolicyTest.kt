@@ -134,7 +134,19 @@ class AssistantAudioRetryPolicyTest {
         assertTrue(reload.contains("id = entity.id,"))
         val llm = source.substringAfter("private fun MessageEntity.toLLMMessage()")
         assertFalse(llm.contains("restoreUserText("))
-        assertTrue(llm.contains("audioParts = com.openminis.app.assistant.AssistantAudioSupport.restore(partsJson)"))
+        assertTrue(llm.contains("audioParts = com.openminis.app.assistant.AssistantAudioSupport.restore(partsJson, context.filesDir)"))
+    }
+
+    @Test fun productionPersistsFileBeforeTransactionAndCleansUpOnFailure() {
+        val source = source()
+        val commit = source.substringAfter("val commitUserTurn: suspend () -> Unit = {")
+            .substringBefore("val userMsg = ChatMessage(")
+        assertTrue(commit.contains("userPartsJson, assistantAudio, context.filesDir, activeSessionId,"))
+        assertTrue(commit.indexOf("AssistantAudioSupport.persist(") < commit.indexOf("database.withTransaction"))
+        assertTrue(commit.contains("val persistedParts = savedAudio.partsJson"))
+        assertTrue(commit.contains("catch (failure: Throwable) {\n                savedAudio.discard()\n                throw failure"))
+        assertTrue(source.contains("dbMessages, messageId, context.filesDir,"))
+        assertTrue(source.contains("entity.role, entity.partsJson, text, context.filesDir,"))
     }
 
     private fun source(): String {
