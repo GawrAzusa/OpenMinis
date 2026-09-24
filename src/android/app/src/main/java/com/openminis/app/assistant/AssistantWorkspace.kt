@@ -7,6 +7,8 @@ import android.net.Uri
 import androidx.lifecycle.ViewModelProvider
 import com.openminis.app.MinisApp
 import com.openminis.app.assistant.screen.AssistantScreenCapture
+import com.openminis.app.provider.voice.VoiceInputRequest
+import com.openminis.app.provider.voice.VoiceProviderFactory
 import com.openminis.app.speech.ReadAloudPlayer
 import com.openminis.app.speech.VoiceOutputState
 import com.openminis.app.ui.chat.ChatViewModel
@@ -27,6 +29,7 @@ object AssistantWorkspace {
         val error: String? = null, val model: String = "正在准备模型…",
         val draft: String = "", val preview: File? = null, val audio: ByteArray? = null,
         val speech: Boolean = false, val voiceLabel: String = "",
+        val transcribing: Boolean = false, val voiceInputLabel: String? = null,
     )
     private val mutable = MutableStateFlow(State())
     val state: StateFlow<State> = mutable.asStateFlow()
@@ -40,6 +43,13 @@ object AssistantWorkspace {
     internal val toolOwnership = AssistantOperationOwnership()
     private var mainDraftShared = false
     private var captureEpoch = 0
+    private var transcriptionJob: Job? = null
+    private val transcription = AssistantSplitTranscription()
+    // Captured before the microphone opens; retries never re-resolve a different provider/model.
+    private data class InputRoute(val label: String, val transcribe: suspend (ByteArray) -> String)
+    private var inputRoute: InputRoute? = null
+    internal var draftRevision = 0L
+        private set
     internal fun voiceRequest() = AssistantVoiceRequest(sessionKey, captureEpoch)
     internal fun currentVoiceRequest(request: AssistantVoiceRequest) =
         request.isCurrent(sessionKey, captureEpoch, visible, toolOwnership.handedOff)
@@ -105,7 +115,12 @@ object AssistantWorkspace {
     }
 
     fun error(message: String?) { mutable.update { it.copy(error = message) } }
-    fun setDraft(text: String) { if (pendingTurn == null) mutable.update { it.copy(draft = text) } }
+    fun setDraft(text: String) {
+        if (pendingTurn != null || text == mutable.value.draft) return
+        draftRevision++
+        cancelRecording()
+        mutable.update { it.copy(draft = text) }
+    }
     fun setVisible(value: Boolean) {
         visible = value
         if (!value) { cancelRecording(); speaker?.stop() }
@@ -126,11 +141,81 @@ object AssistantWorkspace {
         withTimeoutOrNull(3000) { vm?.modelName?.first { it.isNotBlank() } }
         yield() // Provider construction follows the model-name update on the main dispatcher.
     }
-    fun audioUnavailableReason(): String? = vm?.assistantAudioUnavailableReason() ?: if (vm == null) "模型尚未就绪" else null
+    fun audioUnavailableReason(): String? {
+        if (vm == null) return "模型尚未就绪"
+        // A System/default choice is NOT permission to invoke implicit system ASR.
+        if (app?.providerRepository?.resolveVoiceInputChoice()?.entry != null) return null
+        return vm?.assistantAudioUnavailableReason()
+    }
+
+    private fun snapshotInputRoute(): InputRoute? {
+        val repo = app?.providerRepository ?: return null
+        val (instance, entry) = repo.resolveVoiceInputChoice().entry ?: return null
+        val provider = VoiceProviderFactory.make(instance, repo.loadApiKey(instance.id))
+        val model = entry.model
+        val modelId = entry.baseModel.id
+        return InputRoute(model.displayName) { wav ->
+            check(provider != null && provider.supportsVoiceInput) { "配置的服务不支持语音转写" }
+            provider.transcribe(VoiceInputRequest(audioData = wav, model = modelId,
+                resolvedModel = model)).text
+        }
+    }
+
+    private fun enableVoiceReply() {
+        VoiceOutputState.setEnabled(true)
+        VoiceOutputState.setMuted(false)
+        mutable.update { it.copy(speech = true) }
+    }
+
+    /** Prepare text first, then use the session's ordinary sendTurn (including a fresh screen frame). */
+    fun prepareVoiceTurn(onReady: () -> Unit) {
+        val current = mutable.value
+        if (current.busy || current.recording || current.transcribing || pendingTurn != null) return
+        val wav = current.audio
+        val route = inputRoute
+        if (wav == null || route == null) {
+            if (wav != null) enableVoiceReply()
+            onReady()
+            return
+        }
+        if (!visible || toolOwnership.handedOff) return
+        val ticket = transcription.begin(sessionKey, captureEpoch, current.draft, draftRevision) ?: return
+        mutable.update { it.copy(transcribing = true, error = null) }
+        transcriptionJob = scope.launch {
+            val result = transcription.run(ticket,
+                transcribe = { withContext(Dispatchers.IO) { route.transcribe(wav) } },
+                current = {
+                    if (visible && !toolOwnership.handedOff)
+                        AssistantSplitTranscription.Ticket(sessionKey, captureEpoch, mutable.value.draft, draftRevision)
+                    else null
+                },
+            )
+            when (result) {
+                is AssistantSplitTranscription.Result.Text -> {
+                    draftRevision++
+                    mutable.update { it.copy(draft = result.draft, audio = null, transcribing = false) }
+                    // Clear before callback: screen refresh hides/pauses the session synchronously.
+                    transcriptionJob = null
+                    enableVoiceReply()
+                    onReady()
+                }
+                AssistantSplitTranscription.Result.Blank -> mutable.update {
+                    it.copy(audio = null, transcribing = false, error = "没有听清有效文字，未发送。请重新说话或直接打字。")
+                }
+                AssistantSplitTranscription.Result.Failure -> {
+                    // Do not expose provider response bodies/credentials. The same WAV/route remains retryable.
+                    mutable.update { it.copy(transcribing = false,
+                        error = "语音转写失败，录音已保留。点击发送重试，或移除后重新录音；也可检查语音输入设置。") }
+                }
+                AssistantSplitTranscription.Result.Stale -> Unit
+            }
+        }
+    }
 
     fun beginRecording(context: Context, onReady: () -> Unit = {}) {
-        if (!initialize(context) || !visible || mutable.value.busy || pendingTurn != null || mutable.value.recording) return
-        val reason = vm?.assistantAudioUnavailableReason()
+        if (!initialize(context) || !visible || mutable.value.busy || pendingTurn != null || mutable.value.recording || mutable.value.transcribing) return
+        val route = snapshotInputRoute()
+        val reason = if (route == null) vm?.assistantAudioUnavailableReason() else null
         if (reason != null) { error(reason); return }
         if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
             error("麦克风未授权，可以继续打字。")
@@ -138,6 +223,7 @@ object AssistantWorkspace {
         }
         cancelRecording()
         val epoch = ++captureEpoch
+        inputRoute = route
         speaker?.stop()
         error(null)
         val started = recorder?.start(
@@ -152,7 +238,7 @@ object AssistantWorkspace {
                 }
             },
         ) == true
-        mutable.update { it.copy(recording = started, audio = null, paused = false) }
+        mutable.update { it.copy(recording = started, audio = null, paused = false, voiceInputLabel = route?.label) }
         if (started) scope.launch {
             // Audio samples own the 60-second endpoint. This is only a stalled-read failsafe.
             delay((AssistantAudioSupport.MAX_SECONDS + 2) * 1000L)
@@ -175,10 +261,17 @@ object AssistantWorkspace {
     }
     fun cancelRecording() {
         captureEpoch++
+        transcriptionJob?.cancel(); transcriptionJob = null
+        transcription.cancel()
         recorder?.cancel()
-        mutable.update { it.copy(recording = false, level = 0f) }
+        mutable.update { it.copy(recording = false, level = 0f, transcribing = false,
+            audio = if (it.transcribing) null else it.audio) }
     }
-    fun discardAudio() { mutable.update { it.copy(audio = null) } }
+    fun discardAudio() {
+        cancelRecording()
+        inputRoute = null
+        mutable.update { it.copy(audio = null, voiceInputLabel = null) }
+    }
     fun setPreview(file: File?) { mutable.update { it.copy(preview = file) } }
     fun discardPreview() {
         mutable.value.preview?.let { if (it.parentFile?.name == "assistant-preview") it.delete() }
@@ -189,7 +282,11 @@ object AssistantWorkspace {
     fun send() {
         val model = vm ?: return
         val current = mutable.value.copy(audio = mutable.value.audio?.copyOf())
-        if (current.busy || current.recording || pendingTurn != null) return
+        if (current.busy || current.recording || current.transcribing || pendingTurn != null) return
+        // Split-input audio must never reach the task model, even from another caller.
+        if (current.audio != null && inputRoute != null) {
+            error("请先完成语音转写，再发送文字给模型。"); return
+        }
         if (current.draft.isBlank() && current.audio == null && current.preview == null) return
         val frameVersion = AssistantScreenCapture.state.value.selectionVersion
         if (current.preview != null) {

@@ -55,6 +55,7 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
     private var previousTranscript = ""
     private val voiceEntry = AssistantVoiceEntry()
     private var voiceStart: Job? = null
+    private var sendJob: Job? = null
     private val ink = Color.rgb(238, 241, 255)
     private val muted = Color.rgb(157, 169, 199)
     private val blue = Color.rgb(159, 195, 255)
@@ -227,7 +228,11 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
         speech = label("声音：关闭", 11f, muted).apply { minHeight = dp(36); gravity = Gravity.CENTER_VERTICAL; setOnClickListener { AssistantWorkspace.toggleSpeech() } }
         footer.addWeighted(speech)
         footer.addView(action("新对话") { switchToTyping(); awaitingCapture = false; AssistantReturnGate.invalidate(); AssistantWorkspace.newConversation(context) })
-        stop = action("停止任务") { if (AssistantWorkspace.state.value.canResume && !AssistantWorkspace.state.value.busy) AssistantWorkspace.resume() else AssistantWorkspace.pause() }
+        stop = action("停止任务") {
+            val state = AssistantWorkspace.state.value
+            if (state.canResume && !state.busy && !state.transcribing && !state.recording) AssistantWorkspace.resume()
+            else AssistantWorkspace.pause()
+        }
         footer.addView(stop, LinearLayout.LayoutParams(-2, dp(40)).apply { marginStart = dp(6) })
         footer.addView(action("设置") { openSettings() }, LinearLayout.LayoutParams(-2, dp(40)).apply { marginStart = dp(6) })
         card.addView(footer)
@@ -265,7 +270,6 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
                     }
                 }
                 render(AssistantWorkspace.state.value)
-                if (state.active) voiceLabel.text = "屏幕共享中 · 每次发送附带最新画面"
             }
         }
         return root
@@ -303,24 +307,30 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
         refreshRepairGuidance()
         modelLabel.text = state.model
         status.text = when {
+            state.transcribing -> "正在转写语音…完成后发送文字"
             state.recording -> "正在听，请说话…说完会自动发送"
             state.busy -> "正在为你处理…"
             state.paused -> "已暂停，手机交还给你"
+            state.audio != null && state.voiceInputLabel != null -> "录音已保留，点击发送进行转写"
             state.audio != null -> "原声已准备好，点击发送"
             state.lines.isNotEmpty() -> "还需要我帮你做什么？"
             else -> "有什么可以帮你？"
         }
-        if (!shareActive) voiceLabel.text = state.voiceLabel.ifBlank { "打字 · 原声提问 · 看懂你的屏幕" }
+        voiceLabel.text = listOfNotNull(
+            state.voiceInputLabel?.let { "语音转写 · $it → 文字交给任务模型（非原声直传）" },
+            if (shareActive) "屏幕共享中 · 发送时附带最新画面" else state.voiceLabel.ifBlank { "打字 · 原声提问 · 看懂你的屏幕" },
+        ).joinToString("\n")
         val text = state.lines.filter { it.text.isNotBlank() }.joinToString("\n\n") { (if (it.role == "user") "你  ·  " else "Minis  ·  ") + it.text }
         scroll.visibility = if (text.isBlank()) View.GONE else View.VISIBLE
         if (text != previousTranscript) { transcript.text = text; previousTranscript = text; scroll.post { scroll.fullScroll(View.FOCUS_DOWN) } }
         if (input.text.toString() != state.draft) { input.setText(state.draft); input.setSelection(input.length()) }
         mic.text = if (state.recording) "■ 结束" else "◉ 语音"
         mic.setTextColor(if (state.recording) Color.rgb(255, 170, 182) else ink)
-        send.isEnabled = !state.busy && !state.recording
+        send.isEnabled = !state.busy && !state.recording && !state.transcribing
+        mic.isEnabled = !state.transcribing
         send.alpha = if (send.isEnabled) 1f else 0.4f
-        stop.text = if (state.canResume && !state.busy) "继续任务" else "停止任务"
-        stop.isEnabled = state.busy || state.canResume
+        stop.text = if (state.canResume && !state.busy && !state.transcribing && !state.recording) "继续任务" else "停止任务"
+        stop.isEnabled = state.busy || state.canResume || state.transcribing || state.recording
         speech.text = if (state.speech) "声音：开启" else "声音：关闭"
         warning.text = state.error
         warning.visibility = if (state.error.isNullOrBlank()) View.GONE else View.VISIBLE
@@ -333,6 +343,8 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
             preview.setImageURI(state.preview?.let { android.net.Uri.fromFile(it) })
         }
         attachmentText.text = when {
+            state.audio != null && state.voiceInputLabel != null ->
+                (if (state.preview != null) "截图 + " else "") + "录音 · 先转写文字，不直传任务模型"
             state.preview != null && state.audio != null -> "截图 + 原始语音 · 待发送"
             state.preview != null -> "截图 · 待发送给模型"
             else -> "原始语音 · 不转写为文字"
@@ -355,10 +367,17 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
         AssistantScreenCapture.request(context, continuous)
     }
     private fun sendTurn() {
+        if (sendJob?.isActive == true) return
+        AssistantWorkspace.prepareVoiceTurn { sendPreparedTurn() }
+    }
+    private fun sendPreparedTurn() {
+        if (sendJob?.isActive == true) return
         if (!shareActive) { AssistantWorkspace.send(); return }
         val epoch = generation
+        val session = AssistantWorkspace.sessionKey
+        val draftRevision = AssistantWorkspace.draftRevision
         val ticket = AssistantReturnGate.beginTemporary()
-        scope.launch {
+        sendJob = scope.launch {
             // Hide our own assistant surface before sampling the shared display.
             val baseline = AssistantScreenCapture.state.value.frameVersion
             hide()
@@ -366,9 +385,11 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
             val fresh = withTimeoutOrNull(3500) {
                 AssistantScreenCapture.state.first { !it.active || it.frameVersion > baseline }
             }
-            if (generation != epoch || !AssistantReturnGate.current(ticket)) return@launch
+            if (generation != epoch || session != AssistantWorkspace.sessionKey ||
+                draftRevision != AssistantWorkspace.draftRevision || !AssistantReturnGate.current(ticket)) return@launch
             val file = if (fresh?.active == true && fresh.frameVersion > baseline) AssistantScreenCapture.snapshot(context) else null
-            if (generation != epoch || !AssistantReturnGate.current(ticket)) return@launch
+            if (generation != epoch || session != AssistantWorkspace.sessionKey ||
+                draftRevision != AssistantWorkspace.draftRevision || !AssistantReturnGate.current(ticket)) return@launch
             if (file == null) AssistantWorkspace.error("共享画面暂不可用，未发送请求。")
             else { AssistantWorkspace.setPreview(file); AssistantWorkspace.send() }
             MinisVoiceInteractionService.open(context, ticket = ticket)
@@ -394,6 +415,7 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
     }
     private fun closeAll() { generation++; AssistantReturnGate.invalidate(); awaitingCapture = false; AssistantWorkspace.close(context); hide() }
     private fun switchToTyping() {
+        sendJob?.cancel(); sendJob = null
         voiceStart?.cancel(); voiceStart = null
         voiceEntry.cancel()
         AssistantWorkspace.cancelRecording()
@@ -407,7 +429,7 @@ class MinisVoiceSession(context: Context) : VoiceInteractionSession(context) {
             yield()
             AssistantWorkspace.awaitModelReady()
             val state = AssistantWorkspace.state.value
-            if (!AssistantWorkspace.currentVoiceRequest(request) || !shown || toolSurfaceLocked() || state.busy || state.recording || state.audio != null ||
+            if (!AssistantWorkspace.currentVoiceRequest(request) || !shown || toolSurfaceLocked() || state.busy || state.recording || state.transcribing || state.audio != null ||
                 (onlyEmptyComposer && state.draft.isNotBlank())) return@launch
             AssistantWorkspace.audioUnavailableReason()?.let { AssistantWorkspace.error(it); return@launch }
             if (::root.isInitialized) {
