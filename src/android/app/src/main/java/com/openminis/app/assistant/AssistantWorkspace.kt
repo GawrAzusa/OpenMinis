@@ -76,6 +76,8 @@ object AssistantWorkspace {
         ))[ChatViewModel::class.java]
         recorder = AssistantAudioRecorder(application)
         VoiceOutputState.init(application)
+        // Restore the user's saved reply-audio choice, not recorder/task execution.
+        mutable.update { it.copy(speech = VoiceOutputState.canPlay) }
         speaker = ReadAloudPlayer(application, allowSystemFallback = false)
         val model = vm!!
         model.enableAssistantContext()
